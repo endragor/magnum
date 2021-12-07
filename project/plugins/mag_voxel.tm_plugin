@@ -1,0 +1,6 @@
+__type: "tm_plugin"
+__uuid: "acf6365b-9561-83f2-a5d6-409cbcba20ee"
+import_on_change: true
+windows_dll_import_path: "..\\..\\plugins\\bin\\Debug\\mag_voxel.dll"
+windows_dll: "413a7a0373e09580"
+__asset_uuid: "c36b9f30-2181-b984-a93a-c36f1a9c18f3"

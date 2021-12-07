@@ -1,0 +1,5 @@
+*.sln
+*.dll
+/plugins/build
+/plugins/bin
+/plugins/lib

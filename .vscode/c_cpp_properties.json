@@ -1,0 +1,91 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "C:/Program Files (x86)/Microsoft Visual Studio/2019/Community/VC/Tools/MSVC/14.28.29910/include",
+                "C:/Program Files (x86)/Microsoft Visual Studio/2019/Community/VC/Tools/MSVC/14.28.29910/atlmfc/include",
+                "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/um",
+                "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/ucrt",
+                "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/shared",
+                "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/winrt",
+                "${workspaceRoot}",
+                "${TM_SDK_DIR}/headers"
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "TM_OS_WINDOWS"
+            ],
+            "intelliSenseMode": "msvc-x64",
+            "browse": {
+                "path": [
+                    "C:/Program Files (x86)/Microsoft Visual Studio/2019/Community/VC/Tools/MSVC/14.28.29910/include",
+                    "C:/Program Files (x86)/Microsoft Visual Studio/2019/Community/VC/Tools/MSVC/14.28.29910/atlmfc/include",
+                    "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/um",
+                    "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/ucrt",
+                    "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/shared",
+                    "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/winrt",
+                    "${TM_SDK_DIR}/headers",
+                    "${workspaceRoot}"
+                ],
+                "limitSymbolsToIncludedHeaders": true,
+                "databaseFilename": ""
+            },
+            "cStandard": "c11",
+            "cppStandard": "c++17"
+        },
+        {
+            "name": "Mac",
+            "includePath": [
+                "/usr/include",
+                "/usr/local/include",
+                "${TM_SDK_DIR}/headers"
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "TM_OS_MACOSX"
+            ],
+            "intelliSenseMode": "clang-x64",
+            "browse": {
+                "path": [
+                    "/usr/include",
+                    "/usr/local/include",
+                ],
+                "limitSymbolsToIncludedHeaders": true,
+                "databaseFilename": ""
+            },
+            "macFrameworkPath": [
+                "/System/Library/Frameworks",
+                "/Library/Frameworks"
+            ],
+            "compilerPath": "/usr/bin/clang",
+            "cStandard": "c11",
+            "cppStandard": "c++17"
+        },
+        {
+            "name": "Linux",
+            "includePath": [
+                "/usr/include",
+                "/usr/local/include",
+                "${TM_SDK_DIR}/headers"
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "TM_OS_LINUX"
+            ],
+            "intelliSenseMode": "clang-x64",
+            "browse": {
+                "path": [
+                    "/usr/include",
+                    "/usr/local/include"
+                ],
+                "limitSymbolsToIncludedHeaders": true,
+                "databaseFilename": ""
+            }
+        }
+    ],
+    "version": 4
+}

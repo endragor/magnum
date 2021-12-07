@@ -1,0 +1,18 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "tmbuild",
+            "type": "process",
+            "command": "tmbuild.exe",
+            "options": {
+                "cwd": "${workspaceFolder}/plugins"
+            },
+            "problemMatcher": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}

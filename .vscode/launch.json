@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Win64: the-machinery",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${env:TM_SDK_DIR}/bin/the-machinery.exe",
+            "symbolSearchPath": "${workspaceFolder}\\plugins\\bin\\Debug",
+            "symbolLoadInfo": {
+                "loadAll": true,
+            },
+            "args": [
+                "--crash-recovery",
+                "false",
+                "--load-project",
+                "${workspaceFolder}/project/project.the_machinery_dir",
+            ],
+            "logging":{
+                "moduleLoad": true,
+                "trace": true,
+            },
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "console": "integratedTerminal",
+            "presentation": {
+                "group": "2-Win64"
+            }
+        },
+    ]
+}
