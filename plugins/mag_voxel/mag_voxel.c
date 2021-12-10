@@ -45,7 +45,7 @@ static tm_vec3_t find_vertex(float x, float y, float z, tm_vec3_t *p, tm_vec3_t 
         c = tm_vec3_add(c, tm_vec3_mul(p[i], one_to_n));
         for (int e = 0; e < 8; ++e) {
             // add force pointed from the edge towards the plane
-            f[e] = tm_vec3_add(f[e], tm_vec3_mul(n[i], tm_vec3_dot(edges[e], n[i]) + d));
+            f[e] = tm_vec3_add(f[e], tm_vec3_mul(n[i], -tm_vec3_dot(edges[e], n[i]) - d));
         }
     }
 
@@ -68,6 +68,8 @@ static tm_vec3_t find_vertex(float x, float y, float z, tm_vec3_t *p, tm_vec3_t 
 
         c = tm_vec3_add(c, tm_vec3_mul(f_total, 0.05f));
     }
+
+    c = tm_vec3_clamp(c, (tm_vec3_t) { x, y, z }, (tm_vec3_t) { x + 1, y + 1, z + 1 });
 
     c.x -= (float)MAG_VOXEL_MARGIN;
     c.y -= (float)MAG_VOXEL_MARGIN;
@@ -205,49 +207,64 @@ static void dual_contour_region(
     for (int x = 0; x < MAG_VOXEL_REGION_SIZE - 1; ++x) {
         for (int y = 0; y < MAG_VOXEL_REGION_SIZE - 1; ++y) {
             for (int z = 0; z < MAG_VOXEL_REGION_SIZE - 1; ++z) {
-                if (x > 0 && y > 0 && (v[x][y][z] > 0) != (v[x][y][z + 1] > 0)) {
-                    if (ti + 6 > t_capacity) {
-                        t_capacity += CAPACITY_INCREMENT;
-                        tm_carray_temp_resize(triangles, t_capacity, ta);
-                    }
-                    triangles[ti + 2] = cell_vertices[x - 1][y - 1][z];
-                    triangles[ti + 1] = cell_vertices[x - 0][y - 1][z];
-                    triangles[ti + 0] = cell_vertices[x - 1][y - 0][z];
+                if (x > 0 && y > 0) {
+                    bool solid0 = (v[x][y][z] > 0);
+                    bool solid1 = (v[x][y][z + 1] > 0);
+                    if (solid0 != solid1) {
+                        if (ti + 6 > t_capacity) {
+                            t_capacity += CAPACITY_INCREMENT;
+                            tm_carray_temp_resize(triangles, t_capacity, ta);
+                        }
+                        int swap = solid1 ? 2 : 0;
+                        triangles[ti + 2 - swap] = cell_vertices[x - 1][y - 1][z];
+                        triangles[ti + 1] = cell_vertices[x - 0][y - 1][z];
+                        triangles[ti + 0 + swap] = cell_vertices[x - 1][y - 0][z];
 
-                    triangles[ti + 3] = cell_vertices[x - 1][y - 0][z];
-                    triangles[ti + 4] = cell_vertices[x - 0][y - 0][z];
-                    triangles[ti + 5] = cell_vertices[x - 0][y - 1][z];
-                    ti += 6;
+                        triangles[ti + 3 + swap] = cell_vertices[x - 1][y - 0][z];
+                        triangles[ti + 4] = cell_vertices[x - 0][y - 0][z];
+                        triangles[ti + 5 - swap] = cell_vertices[x - 0][y - 1][z];
+                        ti += 6;
+                    }
                 }
 
-                if (x > 0 && z > 0 && (v[x][y][z] > 0) != (v[x][y + 1][z] > 0)) {
-                    if (ti + 6 > t_capacity) {
-                        t_capacity += CAPACITY_INCREMENT;
-                        tm_carray_temp_resize(triangles, t_capacity, ta);
-                    }
-                    triangles[ti + 2] = cell_vertices[x - 1][y][z - 1];
-                    triangles[ti + 1] = cell_vertices[x - 0][y][z - 1];
-                    triangles[ti + 0] = cell_vertices[x - 1][y][z - 0];
+                if (x > 0 && z > 0) {
+                    bool solid0 = (v[x][y][z] > 0);
+                    bool solid1 = (v[x][y + 1][z] > 0);
+                    if (solid0 != solid1) {
+                        if (ti + 6 > t_capacity) {
+                            t_capacity += CAPACITY_INCREMENT;
+                            tm_carray_temp_resize(triangles, t_capacity, ta);
+                        }
+                        int swap = solid0 ? 2 : 0;
+                        triangles[ti + 2 - swap] = cell_vertices[x - 1][y][z - 1];
+                        triangles[ti + 1] = cell_vertices[x - 0][y][z - 1];
+                        triangles[ti + 0 + swap] = cell_vertices[x - 1][y][z - 0];
 
-                    triangles[ti + 3] = cell_vertices[x - 1][y][z - 0];
-                    triangles[ti + 4] = cell_vertices[x - 0][y][z - 0];
-                    triangles[ti + 5] = cell_vertices[x - 0][y][z - 1];
-                    ti += 6;
+                        triangles[ti + 3 + swap] = cell_vertices[x - 1][y][z - 0];
+                        triangles[ti + 4] = cell_vertices[x - 0][y][z - 0];
+                        triangles[ti + 5 - swap] = cell_vertices[x - 0][y][z - 1];
+                        ti += 6;
+                    }
                 }
 
-                if (y > 0 && z > 0 && (v[x][y][z] > 0) != (v[x + 1][y][z] > 0)) {
-                    if (ti + 6 > t_capacity) {
-                        t_capacity += CAPACITY_INCREMENT;
-                        tm_carray_temp_resize(triangles, t_capacity, ta);
-                    }
-                    triangles[ti + 2] = cell_vertices[x][y - 1][z - 1];
-                    triangles[ti + 1] = cell_vertices[x][y - 0][z - 1];
-                    triangles[ti + 0] = cell_vertices[x][y - 1][z - 0];
+                if (y > 0 && z > 0) {
+                    bool solid0 = (v[x][y][z] > 0);
+                    bool solid1 = (v[x + 1][y][z] > 0);
+                    if (solid0 != solid1) {
+                        if (ti + 6 > t_capacity) {
+                            t_capacity += CAPACITY_INCREMENT;
+                            tm_carray_temp_resize(triangles, t_capacity, ta);
+                        }
+                        int swap = solid1 ? 2 : 0;
+                        triangles[ti + 0 + swap] = cell_vertices[x][y - 1][z - 0];
+                        triangles[ti + 1] = cell_vertices[x][y - 0][z - 1];
+                        triangles[ti + 2 - swap] = cell_vertices[x][y - 1][z - 1];
 
-                    triangles[ti + 3] = cell_vertices[x][y - 1][z - 0];
-                    triangles[ti + 4] = cell_vertices[x][y - 0][z - 0];
-                    triangles[ti + 5] = cell_vertices[x][y - 0][z - 1];
-                    ti += 6;
+                        triangles[ti + 3 + swap] = cell_vertices[x][y - 1][z - 0];
+                        triangles[ti + 4] = cell_vertices[x][y - 0][z - 0];
+                        triangles[ti + 5 - swap] = cell_vertices[x][y - 0][z - 1];
+                        ti += 6;
+                    }
                 }
             }
         }
