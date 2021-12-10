@@ -3,7 +3,7 @@
 #include <foundation/api_types.h>
 
 #define MAG_TT_TYPE__TERRAIN_COMPONENT "mag_terrain_component"
-#define MAG_TT_TYPE_HASH__TERRAIN_COMPONENT TM_STATIC_HASH("mag_terrain_component")
+#define MAG_TT_TYPE_HASH__TERRAIN_COMPONENT TM_STATIC_HASH("mag_terrain_component", 0xa6988af44e888d7bULL)
 
 enum {
     MAG_TT_PROP__TERRAIN_COMPONENT__VISIBILITY_FLAGS, //suboject_set

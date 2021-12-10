@@ -255,30 +255,102 @@ static bool set_constant(tm_shader_io_o *io, tm_renderer_resource_command_buffer
     return false;
 }
 
-static void recreate_mesh(mag_terrain_component_t *c, mag_terrain_component_manager_t *man, tm_shader_io_o *io)
+static bool set_resource(tm_shader_io_o *io, tm_renderer_resource_command_buffer_o *res_buf, tm_shader_resource_binder_instance_t *instance,
+    tm_strhash_t name, const tm_renderer_handle_t *resource_handle, const uint32_t *aspect_flags, uint32_t first_resource, uint32_t n_resources)
+{
+    tm_shader_resource_t resource;
+    uint32_t resource_slot;
+    if (tm_shader_api->lookup_resource(io, name, &resource, &resource_slot)) {
+        tm_shader_api->update_resources(io, res_buf, &(tm_shader_resource_update_t) { .instance_id = instance->instance_id, .resource_slot = resource_slot, .first_resource = first_resource, .num_resources = n_resources, .resources = resource_handle, .resources_view_aspect_flags = aspect_flags }, 1);
+        return true;
+    }
+    return false;
+}
+
+static void generate_region_gpu(mag_voxel_region_t *region, tm_renderer_backend_i *rb, tm_shader_repository_o *shader_repo) {
+    TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
+
+    tm_renderer_command_buffer_o *cmd_buf;
+    rb->create_command_buffers(rb->inst, &cmd_buf, 1);
+    tm_renderer_resource_command_buffer_o *res_buf;
+    rb->create_resource_command_buffers(rb->inst, &res_buf, 1);
+
+    tm_renderer_handle_t densities_handle = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+        &(tm_renderer_buffer_desc_t) { .size = sizeof(region->densities), .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_densities" },
+        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
+    tm_renderer_handle_t normals_handle = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+        &(tm_renderer_buffer_desc_t) { .size = sizeof(region->normals), .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_normals" },
+        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
+
+    tm_shader_o *shader = tm_shader_repository_api->lookup_shader(shader_repo, TM_STATIC_HASH("magnum_terrain_gen_region", 0x3f8b44db04e9fd19ULL));
+    tm_shader_io_o *io = tm_shader_api->shader_io(shader);
+    tm_shader_resource_binder_instance_t rbinder;
+    tm_shader_api->create_resource_binder_instances(io, 1, &rbinder);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("densities", 0x9d97839d5465b483ULL), &densities_handle, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("normals", 0x80b4d6fd3ed93beULL), &normals_handle, 0, 0, 1);
+    tm_renderer_shader_info_t shader_info;
+    tm_shader_system_context_o *shader_context = tm_shader_system_api->create_context(a, NULL);
+    uint64_t cur_sort_key = 0;
+    if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, 0, &rbinder, 1, &shader_info)) {
+        tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, &cur_sort_key, &(tm_renderer_compute_info_t){ .dispatch.group_count = { 1, MAG_VOXEL_REGION_SIZE, MAG_VOXEL_REGION_SIZE } }, &shader_info, 1);
+        cur_sort_key += 1;
+    }
+
+    uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
+    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, cur_sort_key, &(tm_renderer_resource_barrier_t){ .resource_handle = densities_handle, .source_state = state, .destination_state = state }, 1);
+
+    const uint64_t sort_key = UINT64_MAX;
+    tm_renderer_api->tm_renderer_command_buffer_api->bind_queue(cmd_buf, sort_key, &(tm_renderer_queue_bind_t){ .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL });
+    uint32_t densities_rr = tm_renderer_api->tm_renderer_command_buffer_api->read_buffer(cmd_buf, sort_key, &(tm_renderer_read_buffer_t){ .resource_handle = densities_handle, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, .resource_state = state, .resource_queue = TM_RENDERER_QUEUE_GRAPHICS, .bits = region->densities, .size = sizeof(region->densities) });
+    uint32_t normals_rr = tm_renderer_api->tm_renderer_command_buffer_api->read_buffer(cmd_buf, sort_key, &(tm_renderer_read_buffer_t){ .resource_handle = normals_handle, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, .resource_state = state, .resource_queue = TM_RENDERER_QUEUE_GRAPHICS, .bits = region->normals, .size = sizeof(region->normals) });
+
+    rb->submit_resource_command_buffers(rb->inst, &res_buf, 1);
+    rb->destroy_resource_command_buffers(rb->inst, &res_buf, 1);
+    rb->submit_command_buffers(rb->inst, &cmd_buf, 1);
+    rb->destroy_command_buffers(rb->inst, &cmd_buf, 1);
+    tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
+
+    while (!rb->read_complete(rb->inst, densities_rr, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL))
+        ;
+    while(!rb->read_complete(rb->inst, normals_rr, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL))
+        ;
+
+    rb->create_resource_command_buffers(rb->inst, &res_buf, 1);
+    tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, densities_handle);
+    tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, normals_handle);
+
+    rb->submit_resource_command_buffers(rb->inst, &res_buf, 1);
+    rb->destroy_resource_command_buffers(rb->inst, &res_buf, 1);
+
+    TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
+}
+
+static void recreate_mesh(mag_terrain_component_t *c, mag_terrain_component_manager_t *man, tm_shader_io_o *io, tm_renderer_backend_i *rb, tm_shader_repository_o *shader_repo)
 {
     TM_PROFILER_BEGIN_FUNC_SCOPE();
     destroy_mesh(c, man);
 
     mag_voxel_region_t region;
-    for (int x = 0; x < MAG_VOXEL_REGION_SIZE; ++x) {
-        for (int y = 0; y < MAG_VOXEL_REGION_SIZE; ++y) {
-            for (int z = 0; z < MAG_VOXEL_REGION_SIZE; ++z) {
-                tm_vec3_t world_pos = {
-                    (float)x - (float)MAG_VOXEL_MARGIN,
-                    (float)y - (float)MAG_VOXEL_MARGIN,
-                    (float)z - (float)MAG_VOXEL_MARGIN,
-                };
-                const float height = 2.f;
-                region.densities[x][y][z] = -world_pos.y + height;
-                region.normals[x][y][z] = (tm_vec3_t) {
-                    0.f,
-                    world_pos.y >= height ? 1.f : -1.f,
-                    0.f
-                };
-            }
-        }
-    }
+    generate_region_gpu(&region, rb, shader_repo);
+
+    // for (int x = 0; x < MAG_VOXEL_REGION_SIZE; ++x) {
+    //     for (int y = 0; y < MAG_VOXEL_REGION_SIZE; ++y) {
+    //         for (int z = 0; z < MAG_VOXEL_REGION_SIZE; ++z) {
+    //             tm_vec3_t world_pos = {
+    //                 (float)x - (float)MAG_VOXEL_MARGIN,
+    //                 (float)y - (float)MAG_VOXEL_MARGIN,
+    //                 (float)z - (float)MAG_VOXEL_MARGIN,
+    //             };
+    //             const float height = 2.f;
+    //             region.densities[x][y][z] = -world_pos.y + height;
+    //             region.normals[x][y][z] = (tm_vec3_t) {
+    //                 0.f,
+    //                 world_pos.y >= height ? 1.f : -1.f,
+    //                 0.f
+    //             };
+    //         }
+    //     }
+    // }
 
     mag_voxel_api->dual_contour_region(
         &region,
@@ -361,7 +433,7 @@ static void render(struct tm_component_manager_o *manager, struct tm_render_args
     uint32_t num_draws = 0;
     for (uint32_t i = 0; i != num_renderables; ++i) {
         mag_terrain_component_t *component = cdata[i];
-        recreate_mesh(component, man, vertex_buffer_io);
+        recreate_mesh(component, man, vertex_buffer_io, man->backend, args->shader_repository);
         if (!component->mesh.vbuf.resource) {
             continue;
         }
