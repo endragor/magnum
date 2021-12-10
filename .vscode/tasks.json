@@ -5,6 +5,7 @@
             "label": "tmbuild",
             "type": "process",
             "command": "tmbuild.exe",
+            "args": ["--no-unit-test"],
             "options": {
                 "cwd": "${workspaceFolder}/plugins"
             },
