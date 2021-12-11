@@ -1,0 +1,119 @@
+depth_stencil_states: {
+    depth_test_enable: true
+    depth_write_enable: true
+    depth_compare_op: "greater_equal"
+}
+
+raster_states: {
+    polygon_mode: "fill"
+    cull_mode: "back"
+    front_face: "ccw"
+}
+
+imports: [
+    { name: "last_tm" type: "float4x4" }
+    { name: "tm" type: "float4x4" }
+    { name: "color" type: "float3" }
+]
+
+vertex_shader: {
+    import_system_semantics : [ "vertex_id" ]
+
+    exports: [
+        { name: "color" type: "float4" }
+        { name: "wn" type: "float3" }
+        { name: "last_position" type: "float3" }
+    ]
+
+    code: [[
+        float4x4 view_projection = load_camera_view_projection();
+        float4x4 tm = load_tm();
+
+        tm_vertex_loader_context ctx;
+        init_vertex_loader_context(ctx);
+        float4 lp = load_position(ctx, vertex_id, 0);
+        output.wn = load_normal(ctx, vertex_id, 0);
+
+        float4 wp = mul(lp, tm);
+        float4 cp = mul(wp, view_projection);
+
+        bool taa_enabled = load_settings_mask() & SETTINGS_TAA_ENABLED;
+        cp = taa_enabled ? add_taa_offset(cp, load_frame_number(), load_render_target_resolution()) : cp;
+        output.position = cp;
+
+        output.color = float4(load_color(), 1);
+
+        #if defined(GBUFFER)
+            float4 last_lp = lp;
+            float4 last_wp = mul(last_lp, load_last_tm());
+            float4 last_cp = mul(last_wp, load_camera_last_view_projection());
+            last_cp = taa_enabled ? add_taa_offset(last_cp, load_frame_number(), load_render_target_resolution()) : last_cp;
+            output.last_position = last_cp.xyw;
+        #endif
+
+        return output;
+    ]]
+}
+
+pixel_shader: {
+    code: [[
+        #if defined(GBUFFER) && 0
+            float3 normal = normalize(input.wn);
+            float3 encoded_normal = encode_signed_oct(normal);
+
+            float3 spec_f0 = float3(0.04, 0.04, 0.04);
+            float roughness = 0.02;
+
+            float4 base = input.color;
+            #if defined(DRAW_SELECTION)
+                base.rgb += float3(0.2,0.4,0.2);
+            #endif
+            output.buffer0 = float4(linear_to_gamma2(base.rgb), base.a);
+            output.buffer1 = float4(encoded_normal.xy, roughness, encoded_normal.z);
+            output.buffer2 = float4(linear_to_gamma2(spec_f0), 0);
+            float2 res = load_render_target_resolution();
+            output.velocity = (((input.position.xy / res) * 2 - 1) * float2(1, -1) - (input.last_position.xy / input.last_position.z)) * 0.5f;
+            return output;
+        #else
+            float opacity = 1.0f;
+
+            float3 normal = normalize(input.wn);
+
+            const float3 dielectric_specular_f0 = float3(0.04, 0.04, 0.04);
+            float metallic = 0.f;
+            float roughness = 0.5f;
+            float ao = 1.f;
+
+            float4 base = input.color;
+            float3 spec_f0 = lerp(dielectric_specular_f0, base.rgb, metallic);
+            base.rgb = lerp(base.rgb * (1 - dielectric_specular_f0), float3(0,0,0), metallic);
+
+            #if defined(GBUFFER)
+                #if defined(GBUFFER_AUX)
+                    uint surface_mask = TM_SURFACE_PROPERTIES_MASK_ADVANCED_MODE;
+                #else
+                    uint surface_mask = 0;
+                #endif
+
+                output.buffer0 = float4(linear_to_gamma2(base.rgb), encode_surface_properties_mask(surface_mask));
+                float3 encoded_normal = encode_signed_oct(normal);
+                output.buffer1 = float4(encoded_normal.xy, roughness, encoded_normal.z);
+                output.buffer2 = float4(linear_to_gamma2(spec_f0), ao);
+                float2 res = load_render_target_resolution();
+                output.velocity = (((input.position.xy / res) * 2 - 1) * float2(1, -1) - (input.last_position.xy / input.last_position.z)) * 0.5f;
+                return output;
+            #endif
+        #endif
+    ]]
+}
+
+compile : {
+    includes: [ "common", "encoding_decoding", "sampling", "bsdf", "magnum_common" ]
+    variations : [
+        { systems: ["frame_system", "viewer_system", "vertex_buffer_system", "shadow_system" ] }
+        { systems: ["frame_system", "viewer_system", "vertex_buffer_system", "gbuffer_system", "selection_system" ] }
+        { systems: ["frame_system", "viewer_system", "vertex_buffer_system", "gbuffer_system" ] }
+        { systems: ["frame_system", "viewer_system", "vertex_buffer_system", "gbuffer_system", "gbuffer_aux_system", "selection_system" ] }
+        { systems: ["frame_system", "viewer_system", "vertex_buffer_system", "gbuffer_system", "gbuffer_aux_system" ] }
+    ]
+}

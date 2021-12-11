@@ -1,0 +1,50 @@
+common: [[
+    #define REGION_SIZE 36
+    #define REGION_MARGIN 2
+
+    #define DENSITY_FUNC(p) sdBox(p, float3(5, 5, 5))
+    //#define DENSITY_FUNC(p) sdSphere(p, 5)
+
+    float sdBox(float3 p, float3 b) {
+        const float3 q = abs(p) - b;
+        return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+    }
+
+    float sdSphere(float3 p, float r) {
+        return length(p) - r;
+    }
+
+    float3 calcNormal(float3 p) {
+        const float h = 0.00001; // replace by an appropriate value
+        const float2 k = float2(1, -1);
+        return normalize( k.xyy*DENSITY_FUNC( p + k.xyy*h ) +
+                          k.yyx*DENSITY_FUNC( p + k.yyx*h ) +
+                          k.yxy*DENSITY_FUNC( p + k.yxy*h ) +
+                          k.xxx*DENSITY_FUNC( p + k.xxx*h ) );
+    }
+
+    // xyz - normal, w - density
+    float4 magnum_density(float3 pos) {
+        float4 ret;
+        float3 center = float3(10, 10, 10);
+        float radius = 5;
+
+        float3 diff = pos - center;
+        float diff_len = length(diff);
+        ret.w = diff_len - radius;
+        ret.xyz = diff / diff_len;
+
+        //ret.w = pos.y - 5;
+        //ret.xyz = float3(0, 1, 0);
+
+        //ret = sdBox(pos - center, float3(5, 5, 5));
+        //ret.w = DENSITY_FUNC(pos - center);
+        //ret.xyz = calcNormal(pos - center);
+
+        return ret;
+    }
+
+    uint flat_offset(uint x, uint y, uint z) {
+        return x * REGION_SIZE * REGION_SIZE + y * REGION_SIZE + z;
+    }
+]]

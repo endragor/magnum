@@ -1,0 +1,273 @@
+imports: [
+    { name: "region_pos" type: "float3" }
+    { name: "cell_size" type: "float" }
+
+    { name: "densities" type: "buffer" }
+    { name: "normals" type: "buffer" }
+    { name: "region_indirect" type: "buffer" uav: true }
+    { name: "vertices" type: "buffer" uav: true }
+    { name: "vertex_normals" type: "buffer" uav: true }
+    { name: "triangles" type: "buffer" uav: true }
+]
+
+compile: {
+    includes: [ "magnum_common" ]
+}
+
+common: [[
+    float3 find_vertex(float3 p[12], float3 n[12], float edge_signs[8], uint count) {
+        const float3 edges[8] = {
+            float3(0, 0, 0),
+            float3(0, 0, 1),
+            float3(0, 1, 0),
+            float3(0, 1, 1),
+            float3(1, 0, 0),
+            float3(1, 0, 1),
+            float3(1, 1, 0),
+            float3(1, 1, 1),
+        };
+        // force at each edge
+        float3 f[8] = {
+            float3(0, 0, 0),
+            float3(0, 0, 0),
+            float3(0, 0, 0),
+            float3(0, 0, 0),
+            float3(0, 0, 0),
+            float3(0, 0, 0),
+            float3(0, 0, 0),
+            float3(0, 0, 0),
+        };
+
+        float3 c = float3(0, 0, 0);
+        float one_to_n = rcp((float)count);
+        for (uint i = 0; i < count; i++) {
+            // distance to the plane at point p[i] with normal n[i]
+            float d = dot(p[i], n[i]);
+
+            c += p[i] * one_to_n;
+            for (uint e = 0; e < 8; ++e) {
+                // add force pointed from the edge towards the plane
+                f[e] -= n[i] * edge_signs[e] * abs(dot(edges[e], n[i]) - d);
+            }
+        }
+
+        for (uint iter = 0; iter < 10; ++iter) {
+            // trilinear interpolation
+            float3 fx1 = lerp(f[0], f[4], c.x);
+            float3 fx2 = lerp(f[1], f[5], c.x);
+            float3 fx3 = lerp(f[2], f[6], c.x);
+            float3 fx4 = lerp(f[3], f[7], c.x);
+
+            float3 fy1 = lerp(fx1, fx3, c.y);
+            float3 fy2 = lerp(fx2, fx4, c.y);
+
+            float3 f_total = lerp(fy1, fy2, c.z);
+
+            if (dot(f_total, f_total) * 0.0025 < 0.00001) {
+                break;
+            }
+
+            c += f_total * 0.05;
+        }
+        return saturate(c);
+    }
+
+    float3 load3(ByteAddressBuffer b, uint3 offset) {
+        return asfloat(b.Load3(flat_offset(offset.x, offset.y, offset.z) * 12));
+    }
+
+    float2 load2at1(ByteAddressBuffer b, uint3 offset) {
+        return asfloat(b.Load2(flat_offset(offset.x, offset.y, offset.z) * 4));
+    }
+]]
+
+compute_shader: {
+    import_system_semantics: [ "dispatch_thread_id" ]
+
+    attributes: {
+        num_threads: [35, 1, 1]
+    }
+
+    code: [[
+        uint3 cell = dispatch_thread_id;
+
+        ByteAddressBuffer densities = get_densities();
+        ByteAddressBuffer region_normals = get_normals();
+
+        float2 v00 = load2at1(densities, cell + uint3(0, 0, 0));
+        float2 v01 = load2at1(densities, cell + uint3(0, 1, 0));
+        float2 v10 = load2at1(densities, cell + uint3(1, 0, 0));
+        float2 v11 = load2at1(densities, cell + uint3(1, 1, 0));
+
+        const float v[2][2][2] = {
+            v00.x,
+            v00.y,
+            v01.x,
+            v01.y,
+            v10.x,
+            v10.y,
+            v11.x,
+            v11.y,
+        };
+
+        const float3 n[2][2][2] = {
+            load3(region_normals, cell + uint3(0, 0, 0)),
+            load3(region_normals, cell + uint3(0, 0, 1)),
+            load3(region_normals, cell + uint3(0, 1, 0)),
+            load3(region_normals, cell + uint3(0, 1, 1)),
+            load3(region_normals, cell + uint3(1, 0, 0)),
+            load3(region_normals, cell + uint3(1, 0, 1)),
+            load3(region_normals, cell + uint3(1, 1, 0)),
+            load3(region_normals, cell + uint3(1, 1, 1)),
+        };
+
+        float3 cellf = (float3)cell;
+        uint3 cellout = (uint3)step(float3(1, 1, 1), cellf);
+
+        // positions of sign changes on the edges of the cell
+        float3 changes[12];
+        // normals at the positions
+        float3 normals[12];
+        uint change_idx = 0;
+        RWByteAddressBuffer region_indirect = get_region_indirect();
+        RWByteAddressBuffer triangles = get_triangles();
+
+        {
+            for (uint dx = 0; dx != 2; ++dx) {
+                for (uint dy = 0; dy != 2; ++dy) {
+                    float v0 = v[dx][dy][0];
+                    float v1 = v[dx][dy][1];
+                    float solid0 = step(v0, 0);
+                    float solid1 = step(v1, 0);
+                    if (solid0 != solid1) {
+                        float distance = v0 / (v0 - v1);
+                        changes[change_idx] = float3((float)dx, (float)dy, distance);
+                        normals[change_idx] = lerp(n[dx][dy][0], n[dx][dy][1], distance);
+                        //normals[change_idx] = magnum_density((cellf + changes[change_idx]) * load_cell_size() + load_region_pos()).xyz;
+                        ++change_idx;
+
+                        if ((1 - dx) & (1 - dy) & cellout.x && cellout.y) {
+                            uint swap = (uint)solid1 * 2;
+                            uint ltriangles[6];
+
+                            ltriangles[0 + swap] = flat_offset(cell.x - 1, cell.y - 1, cell.z);
+                            ltriangles[1] = flat_offset(cell.x - 0, cell.y - 1, cell.z);
+                            ltriangles[2 - swap] = flat_offset(cell.x - 1, cell.y - 0, cell.z);
+
+                            ltriangles[5 - swap] = flat_offset(cell.x - 1, cell.y - 0, cell.z);
+                            ltriangles[4] = flat_offset(cell.x - 0, cell.y - 0, cell.z);
+                            ltriangles[3 + swap] = flat_offset(cell.x - 0, cell.y - 1, cell.z);
+
+                            uint index_start;
+                            region_indirect.InterlockedAdd(0, (uint)6, index_start);
+                            uint3 index_data = uint3(
+                                (ltriangles[0]) | (ltriangles[1] << 16),
+                                (ltriangles[2]) | (ltriangles[3] << 16),
+                                (ltriangles[4]) | (ltriangles[5] << 16)
+                            );
+                            triangles.Store3(index_start << 1, index_data);
+                        }
+                    }
+                }
+            }
+        }
+
+        {
+            for (uint dx = 0; dx != 2; ++dx) {
+                for (uint dz = 0; dz != 2; ++dz) {
+                    float v0 = v[dx][0][dz];
+                    float v1 = v[dx][1][dz];
+                    float solid0 = step(v0, 0);
+                    float solid1 = step(v1, 0);
+                    if (solid0 != solid1) {
+                        float distance = v0 / (v0 - v1);
+                        changes[change_idx] = float3((float)dx, distance, (float)dz);
+                        normals[change_idx] = lerp(n[dx][0][dz], n[dx][1][dz], distance);
+                        //normals[change_idx] = magnum_density((cellf + changes[change_idx]) * load_cell_size() + load_region_pos()).xyz;
+                        ++change_idx;
+
+                        if ((1 - dx) & (1 - dz) & cellout.x & cellout.z) {
+                            uint swap = (uint)solid0 * 2;
+                            uint ltriangles[6];
+
+                            ltriangles[0 + swap] = flat_offset(cell.x - 1, cell.y, cell.z - 1);
+                            ltriangles[1] = flat_offset(cell.x - 0, cell.y, cell.z - 1);
+                            ltriangles[2 - swap] = flat_offset(cell.x - 1, cell.y, cell.z - 0);
+
+                            ltriangles[5 - swap] = flat_offset(cell.x - 1, cell.y, cell.z - 0);
+                            ltriangles[4] = flat_offset(cell.x - 0, cell.y, cell.z - 0);
+                            ltriangles[3 + swap] = flat_offset(cell.x - 0, cell.y, cell.z - 1);
+
+                            uint index_start;
+                            region_indirect.InterlockedAdd(0, (uint)6, index_start);
+                            uint3 index_data = uint3(
+                                (ltriangles[0]) | (ltriangles[1] << 16),
+                                (ltriangles[2]) | (ltriangles[3] << 16),
+                                (ltriangles[4]) | (ltriangles[5] << 16)
+                            );
+                            triangles.Store3(index_start << 1, index_data);
+                        }
+                    }
+                }
+            }
+        }
+
+        {
+            for (uint dy = 0; dy != 2; ++dy) {
+                for (uint dz = 0; dz != 2; ++dz) {
+                    float v0 = v[0][dy][dz];
+                    float v1 = v[1][dy][dz];
+                    float solid0 = step(v0, 0);
+                    float solid1 = step(v1, 0);
+                    if (solid0 != solid1) {
+                        float distance = v0 / (v0 - v1);
+                        changes[change_idx] = float3(distance, (float)dy, (float)dz);
+                        normals[change_idx] = lerp(n[0][dy][dz], n[1][dy][dz], distance);
+                        //normals[change_idx] = magnum_density((cellf + changes[change_idx]) * load_cell_size() + load_region_pos()).xyz;
+                        ++change_idx;
+
+                        if ((1 - dy) & (1 - dz) & cellout.y & cellout.z) {
+                            uint swap = (uint)solid1 * 2;
+                            uint ltriangles[6];
+                            ltriangles[2 - swap] = flat_offset(cell.x, cell.y - 1, cell.z - 0);
+                            ltriangles[1] = flat_offset(cell.x, cell.y - 0, cell.z - 1);
+                            ltriangles[0 + swap] = flat_offset(cell.x, cell.y - 1, cell.z - 1);
+
+                            ltriangles[5 - swap] = flat_offset(cell.x, cell.y - 1, cell.z - 0);
+                            ltriangles[4] = flat_offset(cell.x, cell.y - 0, cell.z - 0);
+                            ltriangles[3 + swap] = flat_offset(cell.x, cell.y - 0, cell.z - 1);
+
+                            uint index_start;
+                            region_indirect.InterlockedAdd(0, (uint)6, index_start);
+                            uint3 index_data = uint3(
+                                (ltriangles[0]) | (ltriangles[1] << 16),
+                                (ltriangles[2]) | (ltriangles[3] << 16),
+                                (ltriangles[4]) | (ltriangles[5] << 16)
+                            );
+                            triangles.Store3(index_start << 1, index_data);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (change_idx > 1) {
+            float3 margin = float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN);
+            const float edge_signs[2][2][2] = {
+                sign(v[0][0][0]),
+                sign(v[0][0][1]),
+                sign(v[0][1][0]),
+                sign(v[0][1][1]),
+                sign(v[1][0][0]),
+                sign(v[1][0][1]),
+                sign(v[1][1][0]),
+                sign(v[1][1][1]),
+            };
+            float3 vertex = (find_vertex(changes, normals, edge_signs, change_idx) + cellf - margin) * load_cell_size();
+
+            uint vertex_offset = flat_offset(cell.x, cell.y, cell.z);
+            get_vertices().Store3(vertex_offset * 12, asuint(vertex));
+            get_vertex_normals().Store3(vertex_offset * 12, asuint(magnum_density(vertex + load_region_pos()).xyz));
+        }
+    ]]
+}

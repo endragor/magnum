@@ -1,0 +1,30 @@
+imports: [
+    { name: "region_pos" type: "float3" }
+    { name: "cell_size" type: "float" }
+
+    { name: "densities" type: "buffer" uav: true }
+    { name: "normals" type: "buffer" uav: true }
+]
+
+compile: {
+    includes: [ "magnum_common" ]
+}
+
+compute_shader: {
+    import_system_semantics: [ "dispatch_thread_id" ]
+
+    attributes: {
+        num_threads: [36, 1, 1]
+    }
+
+    code: [[
+        float3 margin = float3(REGION_MARGIN, 0, 0);
+        float3 region_pos = load_region_pos();
+        float cell_size = load_cell_size();
+        float4 density_ret = magnum_density(region_pos + ((float3)dispatch_thread_id - margin.xxx) * cell_size);
+
+        uint corner_idx = flat_offset(dispatch_thread_id.x, dispatch_thread_id.y, dispatch_thread_id.z);
+        get_densities().Store(corner_idx * 4, asuint(density_ret.w));
+        get_normals().Store3(corner_idx * 12, asuint(density_ret.xyz));
+    ]]
+}
