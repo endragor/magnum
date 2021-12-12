@@ -14,6 +14,7 @@ static struct tm_the_truth_api *tm_the_truth_api;
 static struct tm_the_truth_common_types_api *tm_the_truth_common_types_api;
 static struct tm_logger_api *tm_logger_api;
 static struct tm_visibility_flags_api *tm_visibility_flags_api;
+static struct tm_entity_commands_api *tm_entity_commands_api;
 
 static struct mag_voxel_api *mag_voxel_api;
 
@@ -30,6 +31,7 @@ static struct mag_voxel_api *mag_voxel_api;
 #include <foundation/profiler.h>
 #include <foundation/the_truth.h>
 #include <foundation/the_truth_types.h>
+#include <foundation/unit_test.h>
 #include <foundation/visibility_flags.h>
 
 #include <plugins/editor_views/properties.h>
@@ -68,44 +70,136 @@ enum {
 
 #include "plugins/mag_voxel/mag_voxel.h"
 
+typedef struct region_data_t
+{
+    tm_vec3_t pos;
+    float cell_size;
+    uint64_t key;
+} region_data_t;
+
 typedef struct mag_terrain_component_t
 {
     // Visibility mask built from VISIBILITY_FLAGS in The Truth.
     uint64_t visibility_mask;
-
     tm_vec3_t color_rgb;
 
-    mag_voxel_mesh_t mesh;
-    tm_shader_resource_binder_instance_t rbinder;
-    tm_shader_constant_buffer_instance_t cbuffer;
+    region_data_t region_data;
 
+    mag_voxel_mesh_t mesh;
     tm_renderer_handle_t densities_handle;
     tm_renderer_handle_t normals_handle;
     tm_renderer_handle_t region_indirect;
     tm_renderer_handle_t nbuf;
 
-    tm_vec3_t region_pos;
-    float cell_size;
+    tm_shader_resource_binder_instance_t rbinder;
+    tm_shader_constant_buffer_instance_t cbuffer;
 
-    tm_mat44_t local_to_world;
 } mag_terrain_component_t;
 
-typedef enum region_state_t {
-    // running compute shader to generate voxel data
-    REGION_BUILDING_VOXELS,
-    // running dual contouring
-    REGION_BUILDING_MESH,
-    REGION_READY,
-} region_state_t;
+static int64_t floor_to_f(float val, int64_t size)
+{
+    int64_t floored = (int64_t)floorf(val);
+    int64_t modulo = floored % size;
+    return modulo < 0 ? floored - size - modulo : floored - modulo;
+}
 
-// 1. Obtain voxel data (large cube) from GPU
-// 2. Dual contour it into mesh
-// -- physics/ai missing --
-// 3. Render mesh
+static int64_t ceil_to_f(float val, int64_t size)
+{
+    int64_t ceiled = (int64_t)ceilf(val);
+    int64_t modulo = ceiled % size;
+    return modulo <= 0 ? ceiled - modulo : ceiled + size - modulo;
+}
+
+static tm_vec3_t floor_to(tm_vec3_t v, int64_t size)
+{
+    return (tm_vec3_t) { (float)floor_to_f(v.x, size), (float)floor_to_f(v.y, size), (float)floor_to_f(v.z, size) };
+}
+
+static tm_vec3_t ceil_to(tm_vec3_t v, int64_t size)
+{
+    return (tm_vec3_t) { (float)ceil_to_f(v.x, size), (float)ceil_to_f(v.y, size), (float)ceil_to_f(v.z, size) };
+}
+
+typedef struct aabb_t
+{
+    tm_vec3_t min;
+    tm_vec3_t max;
+} aabb_t;
+
+#define NATURAL_MAP(x) ((uint64_t)((x) < 0 ? (-(x)-1) * 2 + 1 : (x)*2))
+#define NATURAL_PAIR_MAP(x, y) (((x) + (y)) * ((x) + (y) + 1) / 2 + (y))
+
+static region_data_t *wanted_regions(tm_vec3_t camera_pos, tm_temp_allocator_i *ta)
+{
+    const float LOD_DISTANCES[] = {
+        64.f,
+        128.f,
+    };
+
+    tm_vec3_t prev_min = { 0 };
+    tm_vec3_t prev_max = { 0 };
+    float cell_size = 1.f;
+    int64_t icell_size = 1;
+
+    region_data_t *result = NULL;
+    for (uint64_t i = 0; i < TM_ARRAY_COUNT(LOD_DISTANCES); ++i) {
+        tm_vec3_t lod_distance = { LOD_DISTANCES[i], LOD_DISTANCES[i], LOD_DISTANCES[i] };
+        float lod_size = (float)MAG_VOXEL_CHUNK_SIZE * cell_size;
+        int64_t ilod_size = MAG_VOXEL_CHUNK_SIZE * icell_size;
+        tm_vec3_t lod_min = floor_to(tm_vec3_sub(camera_pos, lod_distance), ilod_size * 2);
+        tm_vec3_t lod_max = ceil_to(tm_vec3_add(camera_pos, lod_distance), ilod_size * 2);
+
+        aabb_t partial_aabbs[6];
+        uint32_t aabb_count = 6;
+        if (i == 0) {
+            partial_aabbs[0] = (aabb_t) { lod_min, lod_max };
+            aabb_count = 1;
+        } else {
+            // z-slices
+            partial_aabbs[0] = (aabb_t) { lod_min, { lod_max.x, prev_min.y, lod_max.z } };
+            partial_aabbs[1] = (aabb_t) { { lod_min.x, prev_max.y, lod_min.z }, lod_max };
+
+            // y-slices
+            partial_aabbs[2] = (aabb_t) { { lod_min.x, prev_min.y, lod_min.z }, { lod_max.x, prev_max.y, prev_min.z } };
+            partial_aabbs[3] = (aabb_t) { { lod_min.x, prev_min.y, prev_max.z }, { lod_max.x, prev_max.y, lod_max.z } };
+
+            // x-slices
+            partial_aabbs[4] = (aabb_t) { { lod_min.x, prev_min.y, prev_min.z }, { prev_min.x, prev_max.y, prev_max.z } };
+            partial_aabbs[5] = (aabb_t) { { prev_max.x, prev_min.y, prev_min.z }, { lod_max.x, prev_max.y, prev_max.z } };
+        }
+
+        for (uint32_t ai = 0; ai < aabb_count; ++ai) {
+            const aabb_t *aabb = partial_aabbs + ai;
+            for (float x = aabb->min.x; x < aabb->max.x; x += lod_size) {
+                for (float y = aabb->min.y; y < aabb->max.y; y += lod_size) {
+                    for (float z = aabb->min.z; z < aabb->max.z; z += lod_size) {
+                        uint64_t ux = NATURAL_MAP((int64_t)(x / lod_size));
+                        uint64_t uy = NATURAL_MAP((int64_t)(y / lod_size));
+                        uint64_t uz = NATURAL_MAP((int64_t)(z / lod_size));
+
+                        uint64_t key = ((NATURAL_PAIR_MAP(NATURAL_PAIR_MAP(ux, uy), uz) << 3) | i) + 1;
+                        region_data_t region = {
+                            .pos = { x, y, z },
+                            .cell_size = cell_size,
+                            .key = key,
+                        };
+                        tm_carray_temp_push(result, region, ta);
+                    }
+                }
+            }
+        }
+
+        prev_min = lod_min;
+        prev_max = lod_max;
+        cell_size *= 2.f;
+        icell_size *= 2;
+    }
+
+    return result;
+}
 
 static mag_terrain_component_t default_values = {
     .color_rgb = { 0.8f, 0.8f, 0.8f },
-    .cell_size = 1.f,
 };
 
 typedef struct mag_terrain_component_manager_t
@@ -115,6 +209,8 @@ typedef struct mag_terrain_component_manager_t
 
     tm_renderer_backend_i *backend;
     tm_shader_repository_o *shader_repo;
+
+    tm_component_mask_t component_mask;
 } mag_terrain_component_manager_t;
 
 static float properties_ui(struct tm_properties_ui_args_t *args, tm_rect_t item_rect, tm_tt_id_t object);
@@ -220,6 +316,9 @@ static void destroy(tm_component_manager_o *manager)
 {
     mag_terrain_component_manager_t *man = (mag_terrain_component_manager_t *)manager;
 
+    const tm_component_type_t terrain_component = tm_entity_api->lookup_component_type(man->ctx, MAG_TT_TYPE_HASH__TERRAIN_COMPONENT);
+    tm_entity_api->call_remove_on_all_entities(man->ctx, terrain_component);
+
     tm_entity_context_o *ctx = man->ctx;
     tm_allocator_i a = man->allocator;
     tm_free(&a, man, sizeof(*man));
@@ -241,7 +340,7 @@ static void create_mag_terrain_component(tm_entity_context_o *ctx)
         .ctx = ctx,
         .allocator = a,
         .backend = backend,
-        .shader_repo = shader_repo
+        .shader_repo = shader_repo,
     };
 
     const tm_component_i component = {
@@ -310,8 +409,8 @@ static void generate_sdf(tm_renderer_backend_i *rb, tm_shader_repository_o *shad
     tm_shader_constant_buffer_instance_t cbuf;
     tm_shader_api->create_resource_binder_instances(io, 1, &rbinder);
     tm_shader_api->create_constant_buffer_instances(io, 1, &cbuf);
-    set_constant(io, res_buf, &cbuf, "region_pos", &c->region_pos, sizeof(c->region_pos));
-    set_constant(io, res_buf, &cbuf, "cell_size", &c->cell_size, sizeof(c->cell_size));
+    set_constant(io, res_buf, &cbuf, "region_pos", &c->region_data.pos, sizeof(c->region_data.pos));
+    set_constant(io, res_buf, &cbuf, "cell_size", &c->region_data.cell_size, sizeof(c->region_data.cell_size));
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("densities", 0x9d97839d5465b483ULL), &c->densities_handle, 0, 0, 1);
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("normals", 0x80b4d6fd3ed93beULL), &c->normals_handle, 0, 0, 1);
 
@@ -344,8 +443,8 @@ static void generate_mesh(tm_renderer_backend_i *rb, tm_shader_repository_o *sha
     tm_shader_api->create_resource_binder_instances(io, 1, &rbinder);
     tm_shader_api->create_constant_buffer_instances(io, 1, &cbuf);
 
-    set_constant(io, res_buf, &cbuf, "region_pos", &c->region_pos, sizeof(c->region_pos));
-    set_constant(io, res_buf, &cbuf, "cell_size", &c->cell_size, sizeof(c->cell_size));
+    set_constant(io, res_buf, &cbuf, "region_pos", &c->region_data.pos, sizeof(c->region_data.pos));
+    set_constant(io, res_buf, &cbuf, "cell_size", &c->region_data.cell_size, sizeof(c->region_data.cell_size));
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("densities", 0x9d97839d5465b483ULL), &c->densities_handle, 0, 0, 1);
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("normals", 0x80b4d6fd3ed93beULL), &c->normals_handle, 0, 0, 1);
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("region_indirect", 0xe7e22c1a4906be7fULL), &c->region_indirect, 0, 0, 1);
@@ -490,13 +589,16 @@ static void dual_contour_cpu(mag_terrain_component_t *c, mag_terrain_component_m
     rb->destroy_resource_command_buffers(rb->inst, &res_buf, 1);
 }
 
-static void recreate_mesh(mag_terrain_component_t *c, mag_terrain_component_manager_t *man, tm_shader_io_o *io, tm_renderer_backend_i *rb, tm_shader_repository_o *shader_repo)
+static void recreate_mesh(mag_terrain_component_t *c, mag_terrain_component_manager_t *man)
 {
     TM_PROFILER_BEGIN_FUNC_SCOPE();
     destroy_mesh(c, man);
 
-    generate_region_gpu(rb, shader_repo, io, c);
-    // dual_contour_cpu(c, man, io, rb);
+    tm_shader_system_o *vertex_buffer_system = tm_shader_repository_api->lookup_system(man->shader_repo, tm_murmur_hash_string("vertex_buffer_system"));
+    tm_shader_io_o *vertex_buffer_io = tm_shader_api->system_io(vertex_buffer_system);
+
+    generate_region_gpu(man->backend, man->shader_repo, vertex_buffer_io, c);
+    // dual_contour_cpu(c, man, vertex_buffer_io, man->backend);
 
     TM_PROFILER_END_FUNC_SCOPE();
 }
@@ -515,13 +617,12 @@ static void fill_bounding_volume_buffer(struct tm_component_manager_o *manager, 
 
     mag_terrain_component_t **cdata = (mag_terrain_component_t **)render_component_data;
     for (uint32_t i = 0; i != num_renderables; ++i) {
-        const tm_transform_t *t = &entity_transforms[entity_indices[i]].world;
-        tm_mat44_from_translation_quaternion_scale(&dest->tm, t->pos, t->rot, t->scl);
         mag_terrain_component_t *c = cdata[i];
 
-        const float size = (float)MAG_VOXEL_REGION_SIZE;
+        const float size = (float)MAG_VOXEL_CHUNK_SIZE * c->region_data.cell_size;
+        tm_mat44_from_translation_quaternion_scale(&dest->tm, (tm_vec3_t) { 0, 0, 0 }, (tm_vec4_t) { 0, 0, 0, 0 }, (tm_vec3_t) { 1, 1, 1 });
         dest->visibility_mask = c->visibility_mask;
-        dest->min = (tm_vec3_t) { 0 };
+        dest->min = c->region_data.pos;
         dest->max = (tm_vec3_t) { size, size, size };
         ++dest;
     }
@@ -557,11 +658,9 @@ static void render(struct tm_component_manager_o *manager, struct tm_render_args
     /* carray */ tm_renderer_draw_call_info_t *draw_calls = 0;
     tm_carray_temp_resize(draw_calls, num_viewers * num_renderables, ta);
 
+    tm_shader_system_o *vertex_buffer_system = tm_shader_repository_api->lookup_system(man->shader_repo, tm_murmur_hash_string("vertex_buffer_system"));
     tm_shader_system_o *gbuffer_system = tm_shader_repository_api->lookup_system(args->shader_repository, tm_murmur_hash_string("gbuffer_system"));
     tm_shader_system_o *shadow_system = tm_shader_repository_api->lookup_system(args->shader_repository, tm_murmur_hash_string("shadow_system"));
-
-    tm_shader_system_o *vertex_buffer_system = tm_shader_repository_api->lookup_system(args->shader_repository, tm_murmur_hash_string("vertex_buffer_system"));
-    tm_shader_io_o *vertex_buffer_io = tm_shader_api->system_io(vertex_buffer_system);
 
     uint64_t gbuffer_sort_key = args->render_graph ? tm_render_graph_api->sort_key(args->render_graph, tm_murmur_hash_string("gbuffer")) : 0;
     uint64_t shadows_sort_key = 0;
@@ -571,10 +670,14 @@ static void render(struct tm_component_manager_o *manager, struct tm_render_args
     uint32_t num_draws = 0;
     for (uint32_t i = 0; i != num_renderables; ++i) {
         mag_terrain_component_t *component = cdata[i];
-        const tm_transform_t *et = &entity_transforms[entity_indices[i]].world;
-        component->region_pos = et->pos;
-        component->cell_size = 1.f;
-        recreate_mesh(component, man, vertex_buffer_io, man->backend, args->shader_repository);
+        if (!component->region_data.key) {
+            // component->region_data = (region_data_t) {
+            //     .cell_size = 1.f,
+            //     .key = 1,
+            // };
+            // recreate_mesh(component, man);
+            continue;
+        }
         if (!component->mesh.vbuf.resource) {
             continue;
         }
@@ -585,18 +688,26 @@ static void render(struct tm_component_manager_o *manager, struct tm_render_args
 
         bool updated = false;
         for (uint32_t v = 0; v != num_viewers; ++v) {
+            if (!tm_culling_frustum_visible(frustum_visibility, i, v, num_viewers))
+                continue;
             tm_shader_system_api->activate_system(shader_context, viewers[v].viewer_system, viewers[v].viewer_cbuffer, 1, viewers[v].viewer_rbinder, viewers[v].viewer_rbinder ? 1 : 0);
             tm_shader_system_o *context_system = v == 0 ? gbuffer_system : shadow_system;
             tm_shader_system_api->activate_system(shader_context, context_system, 0, 0, 0, 0);
 
             const uint32_t entity_idx = entity_indices[i];
             if (!updated) {
-                tm_mat44_t last_tm = component->local_to_world;
-                const tm_transform_t *t = &entity_transforms[entity_idx].world;
-                tm_mat44_from_translation_quaternion_scale(&component->local_to_world, t->pos, t->rot, t->scl);
+                // tm_mat44_t last_tm;
+                // const tm_transform_t *t = &entity_transforms[entity_idx].world;
+                // tm_mat44_from_translation_quaternion_scale(&last_tm, t->pos, t->rot, t->scl);
 
-                set_constant(io, args->default_resource_buffer, &cbufs[i], "last_tm", &last_tm, sizeof(last_tm));
-                set_constant(io, args->default_resource_buffer, &cbufs[i], "tm", &component->local_to_world, sizeof(component->local_to_world));
+                // set_constant(io, args->default_resource_buffer, &cbufs[i], "last_tm", &last_tm, sizeof(last_tm));
+                // set_constant(io, args->default_resource_buffer, &cbufs[i], "tm", &last_tm, sizeof(last_tm));
+
+                tm_mat44_t tm;
+                tm_mat44_from_translation_quaternion_scale(&tm, component->region_data.pos, (tm_vec4_t) { 0, 0, 0, 0 }, (tm_vec3_t) { 1, 1, 1 });
+                // TODO: rm
+                set_constant(io, args->default_resource_buffer, &cbufs[i], "last_tm", &tm, sizeof(tm));
+                set_constant(io, args->default_resource_buffer, &cbufs[i], "tm", &tm, sizeof(tm));
                 set_constant(io, args->default_resource_buffer, &cbufs[i], "color", &cdata[i]->color_rgb, sizeof(tm_vec3_t));
                 updated = true;
             }
@@ -659,11 +770,113 @@ static tm_properties_aspect_i *properties_aspect = &(tm_properties_aspect_i) {
     .get_type_display_name = get_type_display_name,
 };
 
+static void test_mag_terrain_component(tm_unit_test_runner_i *tr, tm_allocator_i *a)
+{
+    TM_INIT_TEMP_ALLOCATOR(ta);
+
+    region_data_t *regions = wanted_regions((tm_vec3_t) { 0, 0, 0 }, ta);
+    TM_UNIT_TEST(tr, tm_carray_size(regions) < 1200);
+
+    TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
+}
+
+static tm_unit_test_i *mag_terrain_component_tests = &(tm_unit_test_i) {
+    .name = "mag_terrain_component",
+    .test = test_mag_terrain_component
+};
+
+void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *data, struct tm_entity_commands_o *commands)
+{
+    mag_terrain_component_manager_t *man = (mag_terrain_component_manager_t *)inst;
+
+    TM_INIT_TEMP_ALLOCATOR(ta);
+
+    const tm_transform_t *camera_transform = tm_entity_api->get_blackboard_ptr(man->ctx, TM_ENTITY_BB__CAMERA_TRANSFORM);
+    if (!camera_transform)
+        return;
+    region_data_t *regions_to_render = wanted_regions(camera_transform->pos, ta);
+
+    for (tm_engine_update_array_t *a = data->arrays; a < data->arrays + data->num_arrays; ++a) {
+        mag_terrain_component_t *components = a->components[0];
+
+        for (uint32_t i = 0; i < a->n; ++i) {
+            mag_terrain_component_t *c = components + i;
+            // if (c->region_data.key)
+            //     continue;
+            // c->region_data = (region_data_t){
+            //     .pos = {0, 0, 0},
+            //     .cell_size = 1.f,
+            //     .key = 1,
+            // };
+            // recreate_mesh(c, man);
+            // continue;
+
+            bool existing = false;
+            for (uint64_t r = 0; r < tm_carray_size(regions_to_render); ++r) {
+                if (regions_to_render[r].key == c->region_data.key) {
+                    regions_to_render[r] = regions_to_render[tm_carray_size(regions_to_render) - 1];
+                    tm_carray_pop(regions_to_render);
+                    existing = true;
+                    break;
+                }
+            }
+
+            if (!existing) {
+                if (tm_carray_size(regions_to_render)) {
+                    c->region_data = tm_carray_pop(regions_to_render);
+                    recreate_mesh(c, man);
+                } else {
+                    c->region_data.key = 0;
+                    destroy_mesh(c, man);
+                }
+            }
+        }
+    }
+
+    if (tm_carray_size(regions_to_render)) {
+        for (uint64_t r = 0; r < tm_carray_size(regions_to_render); ++r) {
+            tm_entity_commands_api->create_entity_from_mask(commands, &man->component_mask);
+        }
+    }
+
+    TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
+}
+
+static void entity_simulation__register(struct tm_entity_context_o *ctx)
+{
+    if (tm_entity_api->get_blackboard_double(ctx, TM_ENTITY_BB__EDITOR, 0))
+        return;
+
+    const tm_component_type_t mag_terrain_component = tm_entity_api->lookup_component_type(ctx, MAG_TT_TYPE_HASH__TERRAIN_COMPONENT);
+    const tm_component_type_t transform_component = tm_entity_api->lookup_component_type(ctx, TM_TT_TYPE_HASH__TRANSFORM_COMPONENT);
+
+    if (!mag_terrain_component.index)
+        return;
+
+    // TOOD: move to components_created
+    mag_terrain_component_manager_t *man = (mag_terrain_component_manager_t *)tm_entity_api->component_manager(ctx, mag_terrain_component);
+    man->component_mask = tm_entity_api->create_component_mask((tm_component_type_t[2]) { transform_component, mag_terrain_component }, 2);
+
+    const tm_engine_i mirror_sound_sources = {
+        .ui_name = TM_LOCALIZE_LATER("Magnum Terrain"),
+        .hash = MAG_ENGINE__TERRAIN,
+        .num_components = 1,
+        .components = { mag_terrain_component },
+        .writes = { true },
+        .update = engine__update_terrain,
+        .inst = (tm_engine_o *)man,
+        .before_me = { TM_PHASE__CAMERA },
+        .after_me = { TM_PHASE__RENDER },
+    };
+    tm_entity_api->register_engine(ctx, &mirror_sound_sources);
+}
+
 TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
 {
     tm_global_api_registry = reg;
 
     tm_entity_api = tm_get_api(reg, tm_entity_api);
+    tm_entity_commands_api = tm_get_api(reg, tm_entity_commands_api);
     tm_error_api = tm_get_api(reg, tm_error_api);
     tm_profiler_api = tm_get_api(reg, tm_profiler_api);
     tm_localizer_api = tm_get_api(reg, tm_localizer_api);
@@ -678,7 +891,11 @@ TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
     tm_the_truth_common_types_api = tm_get_api(reg, tm_the_truth_common_types_api);
     tm_logger_api = tm_get_api(reg, tm_logger_api);
     tm_visibility_flags_api = tm_get_api(reg, tm_visibility_flags_api);
+
     mag_voxel_api = tm_get_api(reg, mag_voxel_api);
+
+    tm_add_or_remove_implementation(reg, load, tm_unit_test_i, mag_terrain_component_tests);
+    tm_add_or_remove_implementation(reg, load, tm_entity_register_engines_simulation_i, entity_simulation__register);
 
     tm_add_or_remove_implementation(reg, load, tm_the_truth_create_types_i, create_truth_types);
     tm_add_or_remove_implementation(reg, load, tm_entity_create_component_i, create_mag_terrain_component);
