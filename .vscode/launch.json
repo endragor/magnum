@@ -28,5 +28,30 @@
                 "group": "2-Win64"
             }
         },
-    ]
+        {
+            "name": "Win64: unit-test",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${env:TM_SDK_DIR}/bin/unit-test.exe",
+            "symbolSearchPath": "${workspaceFolder}\\plugins\\bin\\Debug",
+            "symbolLoadInfo": {
+                "loadAll": true,
+            },
+            "args": [
+                "-p",
+                "${workspaceFolder}\\plugins\\bin\\Debug\\mag_voxel.dll",
+            ],
+            "logging":{
+                "moduleLoad": true,
+                "trace": true,
+            },
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "console": "integratedTerminal",
+            "presentation": {
+                "group": "2-Win64"
+            }
+        },
+    ],
 }
