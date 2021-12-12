@@ -1,17 +1,25 @@
+static struct tm_error_api *tm_error_api;
+
 #include "mag_voxel.h"
 
+#include <foundation/allocator.h>
 #include <foundation/api_registry.h>
 #include <foundation/api_type_hashes.h>
+#include <foundation/error.h>
+#include <foundation/unit_test.h>
+
 #include <foundation/carray.inl>
+#include <foundation/hash.inl>
 #include <foundation/math.inl>
 #include <foundation/murmurhash64a.inl>
 
-#include <plugins/renderer/commands.h>
 #include <plugins/renderer/render_backend.h>
 #include <plugins/renderer/render_command_buffer.h>
 #include <plugins/renderer/renderer.h>
 #include <plugins/renderer/resources.h>
 #include <plugins/shader_system/shader_system.h>
+
+#define tm_hash_get_ptr(h, key) ((h)->values + tm_hash_index(h, key))
 
 static struct tm_shader_api *tm_shader_api;
 static struct tm_renderer_api *tm_renderer_api;
@@ -319,8 +327,408 @@ end:
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
 
-static struct mag_voxel_api api = {
+static struct mag_voxel_api mag_voxel_api = {
     .dual_contour_region = dual_contour_region,
+};
+
+typedef struct aabb_t
+{
+    tm_vec3_t center;
+    tm_vec3_t half_size;
+} aabb_t;
+
+static aabb_t aabb_from_min_max(tm_vec3_t min, tm_vec3_t max)
+{
+    tm_vec3_t half_size = tm_vec3_mul(tm_vec3_sub(max, min), 0.5f);
+    tm_vec3_t center = tm_vec3_add(min, half_size);
+    return (aabb_t) { center, half_size };
+}
+
+static bool aabb_intersect(const aabb_t *a, const aabb_t *b)
+{
+    tm_vec3_t amin = tm_vec3_sub(a->center, a->half_size);
+    tm_vec3_t amax = tm_vec3_add(a->center, a->half_size);
+
+    tm_vec3_t bmin = tm_vec3_sub(b->center, b->half_size);
+    tm_vec3_t bmax = tm_vec3_add(b->center, b->half_size);
+
+    return (
+        amin.x <= bmax.x && amax.x >= bmin.x && amin.y <= bmax.y && amax.y >= bmin.y && amin.z <= bmax.z && amax.z >= bmin.z);
+}
+
+typedef struct mag_tree_region_t
+{
+    tm_vec3_t pos;
+    float cell_size;
+    uint64_t key;
+} mag_tree_region_t;
+
+typedef struct mag_region_tree_node_t
+{
+    /* carray */ mag_tree_region_t *regions;
+    uint8_t child_mask;
+} mag_region_tree_node_t;
+
+typedef struct mag_region_tree_t
+{
+    struct TM_HASH_T(uint64_t, mag_region_tree_node_t) nodes;
+    mag_region_tree_node_t root;
+    aabb_t aabb;
+    tm_allocator_i *allocator;
+} mag_region_tree_t;
+
+static aabb_t tree_region_aabb(tm_vec3_t region_pos, float cell_size)
+{
+    float region_size = (float)MAG_VOXEL_CHUNK_SIZE * cell_size;
+    float half_size = region_size * 0.5f;
+    tm_vec3_t half_size_vec = { half_size, half_size, half_size };
+    return (aabb_t) { tm_vec3_add(region_pos, half_size_vec), half_size_vec };
+}
+
+static aabb_t child_aabb(uint32_t child_idx, const aabb_t *node_aabb)
+{
+    tm_vec3_t child_half_size = tm_vec3_mul(node_aabb->half_size, 0.5f);
+    tm_vec3_t center_diff = {
+        child_idx & 1 ? child_half_size.x : -child_half_size.x,
+        child_idx & 2 ? child_half_size.y : -child_half_size.y,
+        child_idx & 4 ? child_half_size.z : -child_half_size.z,
+    };
+    tm_vec3_t child_center = tm_vec3_add(node_aabb->center, center_diff);
+
+    return (aabb_t) { child_center, child_half_size };
+}
+
+static uint32_t child_idx_for_point(tm_vec3_t node_center, tm_vec3_t point)
+{
+    tm_vec3_t obj_center_diff = tm_vec3_sub(point, node_center);
+    uint32_t child_i = 0;
+    child_i |= obj_center_diff.x >= 0 ? 1 : 0;
+    child_i |= obj_center_diff.y >= 0 ? 2 : 0;
+    child_i |= obj_center_diff.z >= 0 ? 4 : 0;
+    return child_i;
+}
+
+static mag_region_tree_t *octree_create(tm_allocator_i *allocator, tm_vec3_t min, tm_vec3_t max)
+{
+    mag_region_tree_t *result = tm_alloc(allocator, sizeof(mag_region_tree_t));
+    *result = (mag_region_tree_t) {
+        .allocator = allocator,
+        .aabb = aabb_from_min_max(min, max),
+        .nodes = { .allocator = allocator },
+    };
+    return result;
+}
+
+static void octree_free_regions_recur(mag_region_tree_t *octree, uint64_t node_id, mag_region_tree_node_t *node)
+{
+    uint8_t child_mask = node->child_mask;
+    if (child_mask) {
+        for (uint32_t i = 0; i < 8; ++i) {
+            if (child_mask & ((uint8_t)1 << i)) {
+                uint64_t child_id = (node_id << 3) | i;
+                octree_free_regions_recur(octree, child_id, tm_hash_get_ptr(&octree->nodes, child_id));
+            }
+        }
+    } else {
+        tm_carray_free(node->regions, octree->allocator);
+    }
+}
+
+static void octree_destroy(mag_region_tree_t *octree)
+{
+    octree_free_regions_recur(octree, 1, &octree->root);
+    tm_hash_free(&octree->nodes);
+    tm_free(octree->allocator, octree, sizeof(*octree));
+}
+
+static void octree_query_recur(const mag_region_tree_t *octree, const aabb_t *aabb, tm_temp_allocator_i *ta, uint64_t **result, const mag_region_tree_node_t *node, const aabb_t *node_aabb, uint64_t node_id)
+{
+    if (!node->child_mask) {
+        for (uint64_t i = 0; i < tm_carray_size(node->regions); ++i) {
+            mag_tree_region_t *region = node->regions + i;
+            aabb_t region_aabb = tree_region_aabb(region->pos, region->cell_size);
+            if (aabb_intersect(aabb, &region_aabb)) {
+                tm_carray_temp_push(*result, region->key, ta);
+            }
+        }
+    } else {
+        for (uint8_t i = 0; i < 8; ++i) {
+            if (node->child_mask & ((uint8_t)1 << i)) {
+                uint64_t child_id = (node_id << 3) | (uint64_t)i;
+                // TODO: actual hash
+                uint64_t child_hash = child_id;
+                aabb_t caabb = child_aabb(i, node_aabb);
+                if (aabb_intersect(aabb, &caabb)) {
+                    mag_region_tree_node_t *child = tm_hash_get_ptr(&octree->nodes, child_hash);
+                    octree_query_recur(octree, aabb, ta, result, child, &caabb, child_id);
+                }
+            }
+        }
+    }
+}
+
+static uint64_t *octree_query(const mag_region_tree_t *octree, tm_vec3_t min, tm_vec3_t max, tm_temp_allocator_i *ta)
+{
+    tm_vec3_t half_size = tm_vec3_mul(tm_vec3_sub(max, min), 0.5f);
+    tm_vec3_t center = tm_vec3_add(min, half_size);
+    aabb_t aabb = { center, half_size };
+
+    aabb_t cur_aabb = octree->aabb;
+    const mag_region_tree_node_t *cur_node = &octree->root;
+    uint64_t cur_id = 1;
+    uint64_t *result = NULL;
+    if (aabb_intersect(&aabb, &cur_aabb)) {
+        octree_query_recur(octree, &aabb, ta, &result, cur_node, &cur_aabb, cur_id);
+    }
+    return result;
+}
+
+static mag_region_tree_node_t *octree_split_node(mag_region_tree_t *octree, mag_region_tree_node_t *node, uint64_t node_id, const aabb_t *node_aabb)
+{
+    uint8_t child_mask = 0;
+    mag_tree_region_t *child_regions[8] = { 0 };
+    for (uint64_t i = 0; i < tm_carray_size(node->regions); ++i) {
+        tm_vec3_t center = tree_region_aabb(node->regions[i].pos, node->regions[i].cell_size).center;
+        uint32_t child_i = child_idx_for_point(node_aabb->center, center);
+        tm_carray_push(child_regions[child_i], node->regions[i], octree->allocator);
+        child_mask |= ((uint8_t)1 << child_i);
+    }
+
+    tm_carray_free(node->regions, octree->allocator);
+    node->regions = NULL;
+    node->child_mask = child_mask;
+
+    for (uint32_t i = 0; i < 8; ++i) {
+        if (child_regions[i]) {
+            uint64_t child_id = (node_id << 3) | i;
+            *tm_hash_add_reference(&octree->nodes, child_id) = (mag_region_tree_node_t) {
+                .regions = child_regions[i]
+            };
+        }
+    }
+
+    return node_id == 1 ? node : tm_hash_get_ptr(&octree->nodes, node_id);
+}
+
+#define SPLIT_THRESHOLD 16
+#define COLLAPSE_THRESHOLD 8
+
+static void octree_insert(mag_region_tree_t *octree, tm_vec3_t region_pos, float cell_size, uint64_t key)
+{
+    // TODO: warn if region is outside octree boundaries
+
+    aabb_t aabb = tree_region_aabb(region_pos, cell_size);
+
+    mag_region_tree_node_t *node = &octree->root;
+    aabb_t node_aabb = octree->aabb;
+    uint64_t node_id = 1;
+    if (key == 16) {
+        node_id = 1;
+    }
+    if (key == 54) {
+        node_id = 1;
+    }
+    while (true) {
+        if (!node->child_mask) {
+            uint64_t cur_size = tm_carray_size(node->regions);
+            if (cur_size < SPLIT_THRESHOLD) {
+                mag_tree_region_t region = { .pos = region_pos, .cell_size = cell_size, .key = key };
+                tm_carray_push(node->regions, region, octree->allocator);
+                break;
+            } else {
+                node = octree_split_node(octree, node, node_id, &node_aabb);
+            }
+        }
+
+        uint32_t child_i = child_idx_for_point(node_aabb.center, aabb.center);
+        node_aabb = child_aabb(child_i, &node_aabb);
+        node_id = (node_id << 3) | child_i;
+
+        if (node->child_mask & ((uint8_t)1 << child_i)) {
+            node = tm_hash_get_ptr(&octree->nodes, node_id);
+        } else {
+            node->child_mask |= (uint8_t)1 << child_i;
+            node = tm_hash_add_reference(&octree->nodes, node_id);
+            *node = (mag_region_tree_node_t) { 0 };
+        }
+    }
+}
+
+static void octree_collapse_regions(mag_region_tree_t *octree, uint64_t node_id, mag_tree_region_t **regions)
+{
+    mag_region_tree_node_t *node = tm_hash_get_ptr(&octree->nodes, node_id);
+
+    if (!node->child_mask) {
+        tm_carray_push_array(*regions, node->regions, tm_carray_size(node->regions), octree->allocator);
+        tm_carray_free(node->regions, octree->allocator);
+    } else {
+        uint8_t child_mask = node->child_mask;
+        for (uint32_t i = 0; i < 8; ++i) {
+            if (child_mask & ((uint8_t)1 << i)) {
+                uint64_t child_id = (node_id << 3) | i;
+                octree_collapse_regions(octree, child_id, regions);
+            }
+        }
+    }
+
+    tm_hash_remove(&octree->nodes, node_id);
+}
+
+static void count_regions_for_collapse(mag_region_tree_t *octree, uint64_t node_id, uint64_t *region_count)
+{
+    mag_region_tree_node_t *node = tm_hash_get_ptr(&octree->nodes, node_id);
+    if (node->child_mask) {
+        for (uint32_t i = 0; i < 8; ++i) {
+            if (node->child_mask & ((uint8_t)1 << i)) {
+                uint64_t child_id = (node_id << 3) | i;
+                count_regions_for_collapse(octree, child_id, region_count);
+                if (*region_count >= COLLAPSE_THRESHOLD)
+                    break;
+            }
+        }
+    } else {
+        *region_count += tm_carray_size(node->regions);
+    }
+}
+
+static bool octree_remove(mag_region_tree_t *octree, tm_vec3_t region_pos, float cell_size, uint64_t key)
+{
+    aabb_t aabb = tree_region_aabb(region_pos, cell_size);
+
+    mag_region_tree_node_t *node = &octree->root;
+    aabb_t node_aabb = octree->aabb;
+    uint64_t node_id = 1;
+    while (node->child_mask) {
+        uint32_t child_i = child_idx_for_point(node_aabb.center, aabb.center);
+        if (!(node->child_mask & ((uint8_t)1 << child_i))) {
+            return false;
+        }
+
+        node_aabb = child_aabb(child_i, &node_aabb);
+        node_id = (node_id << 3) | child_i;
+        node = tm_hash_get_ptr(&octree->nodes, node_id);
+    }
+
+    uint64_t region_count = tm_carray_size(node->regions);
+    bool found = false;
+    for (uint64_t i = 0; i < region_count; ++i) {
+        if (node->regions[i].key == key) {
+            if (i < region_count - 1)
+                node->regions[i] = node->regions[region_count - 1];
+            tm_carray_shrink(node->regions, region_count - 1);
+            found = true;
+            region_count -= 1;
+            break;
+        }
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    if (!region_count && node_id != 1) {
+        tm_carray_free(node->regions, octree->allocator);
+        tm_hash_remove(&octree->nodes, node_id);
+    }
+
+    if (region_count < COLLAPSE_THRESHOLD && node_id != 1) {
+        uint64_t parent_id = node_id >> 3;
+        mag_region_tree_node_t *parent = parent_id == 1 ? &octree->root : tm_hash_get_ptr(&octree->nodes, parent_id);
+        if (!region_count)
+            parent->child_mask &= ~((uint8_t)1 << (node_id & 7));
+
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint64_t child_id = (parent_id << 3) | i;
+            if (child_id == node_id) {
+                continue;
+            }
+            count_regions_for_collapse(octree, child_id, &region_count);
+            if (region_count >= COLLAPSE_THRESHOLD) {
+                return true;
+            }
+        }
+
+        // collapse threshold reached, turn this node into leaf
+        uint8_t child_mask = parent->child_mask;
+        parent->child_mask = 0;
+        tm_carray_ensure(parent->regions, region_count, octree->allocator);
+        // parent pointer will be invalid below, so need to copy the region pointer
+        mag_tree_region_t *regions = parent->regions;
+        for (uint32_t i = 0; i < 8; ++i) {
+            if (child_mask & ((uint8_t)1 << i)) {
+                uint64_t child_id = (parent_id << 3) | i;
+                octree_collapse_regions(octree, child_id, &regions);
+            }
+        }
+    }
+
+    return true;
+}
+
+static struct mag_region_tree_api tree_api = {
+    .create = octree_create,
+    .destroy = octree_destroy,
+    .insert = octree_insert,
+    .remove = octree_remove,
+    .query = octree_query,
+};
+
+#define MAG_TEST_KEY_COUNT(tr, keys, expected) \
+    TM_UNIT_TESTF((tr), tm_carray_size(keys) == (expected), "expected %llu keys, got %llu", expected, tm_carray_size(keys));
+
+static void unit_test_tree_api(tm_unit_test_runner_i *tr, tm_allocator_i *a)
+{
+    TM_INIT_TEMP_ALLOCATOR(ta);
+
+    mag_region_tree_t *tree = tree_api.create(a, (tm_vec3_t) { 0, 0, 0 }, (tm_vec3_t) { 10000, 10000, 10000 });
+
+    const uint32_t insert_size = 10;
+    for (uint32_t x = 0; x < insert_size; ++x) {
+        for (uint32_t y = 0; y < insert_size; ++y) {
+            for (uint32_t z = 0; z < insert_size; ++z) {
+                tree_api.insert(tree, (tm_vec3_t) { (float)(32 * x), (float)(32 * y), (float)(32 * z) }, 1.f, x * insert_size * insert_size + y * insert_size + z);
+            }
+        }
+    }
+
+    {
+        uint64_t *keys = tree_api.query(tree, (tm_vec3_t) { 0, 0, 0 }, (tm_vec3_t) { 5, 5, 5 }, ta);
+        MAG_TEST_KEY_COUNT(tr, keys, 1)
+        TM_UNIT_TEST(tr, keys[0] == 0);
+    }
+
+    {
+        uint64_t *keys = tree_api.query(tree, (tm_vec3_t) { 0, 0, 0 }, (tm_vec3_t) { 33, 33, 33 }, ta);
+        MAG_TEST_KEY_COUNT(tr, keys, 8);
+    }
+
+    {
+        tree_api.remove(tree, (tm_vec3_t) { 0, 0, 0 }, 1.f, 0);
+        uint64_t *keys = tree_api.query(tree, (tm_vec3_t) { 0, 0, 0 }, (tm_vec3_t) { 5, 5, 5 }, ta);
+        MAG_TEST_KEY_COUNT(tr, keys, 0);
+    }
+
+    for (uint32_t x = 0; x < insert_size; ++x) {
+        for (uint32_t y = 0; y < insert_size; ++y) {
+            for (uint32_t z = 0; z < insert_size; ++z) {
+                tree_api.remove(tree, (tm_vec3_t) { (float)(32 * x), (float)(32 * y), (float)(32 * z) }, 1.f, x * insert_size * insert_size + y * insert_size + z);
+            }
+        }
+    }
+
+    {
+        uint64_t *keys = tree_api.query(tree, (tm_vec3_t) { 0, 0, 0 }, (tm_vec3_t) { 10000, 10000, 10000 }, ta);
+        MAG_TEST_KEY_COUNT(tr, keys, 0)
+    }
+    TM_UNIT_TEST(tr, !tree->root.child_mask);
+
+    tree_api.destroy(tree);
+    TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
+}
+
+static tm_unit_test_i *mag_region_tree_api_tests = &(tm_unit_test_i) {
+    .name = "mag_region_tree_api",
+    .test = unit_test_tree_api
 };
 
 TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
@@ -330,8 +738,12 @@ TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
     tm_shader_api = tm_get_api(reg, tm_shader_api);
     tm_renderer_api = tm_get_api(reg, tm_renderer_api);
     tm_temp_allocator_api = tm_get_api(reg, tm_temp_allocator_api);
+    tm_error_api = tm_get_api(reg, tm_error_api);
 
-    tm_set_or_remove_api(reg, load, mag_voxel_api, &api);
+    tm_set_or_remove_api(reg, load, mag_voxel_api, &mag_voxel_api);
+    tm_set_or_remove_api(reg, load, mag_region_tree_api, &tree_api);
+
+    tm_add_or_remove_implementation(reg, load, tm_unit_test_i, mag_region_tree_api_tests);
 
     reg->end_context("mag_voxel");
 }
