@@ -27,7 +27,7 @@ static struct tm_temp_allocator_api *tm_temp_allocator_api;
 
 #define ADAPT(v0, v1) (-v0 / (v1 - v0))
 
-static tm_vec3_t find_vertex(float x, float y, float z, tm_vec3_t *p, tm_vec3_t *n, int count)
+static tm_vec3_t find_vertex(float x, float y, float z, tm_vec3_t p[12], tm_vec3_t n[12], int count, float corner_signs[8])
 {
     // Based on https://www.inf.ufrgs.br/~comba/papers/thesis/diss-leonardo.pdf
 
@@ -53,7 +53,7 @@ static tm_vec3_t find_vertex(float x, float y, float z, tm_vec3_t *p, tm_vec3_t 
         c = tm_vec3_add(c, tm_vec3_mul(p[i], one_to_n));
         for (int e = 0; e < 8; ++e) {
             // add force pointed from the edge towards the plane
-            f[e] = tm_vec3_add(f[e], tm_vec3_mul(n[i], -tm_vec3_dot(edges[e], n[i]) - d));
+            f[e] = tm_vec3_add(f[e], tm_vec3_mul(n[i], -corner_signs[e] * fabsf(tm_vec3_dot(edges[e], n[i]) + d)));
         }
     }
 
@@ -70,7 +70,8 @@ static tm_vec3_t find_vertex(float x, float y, float z, tm_vec3_t *p, tm_vec3_t 
 
         tm_vec3_t f_total = tm_vec3_lerp(fy1, fy2, cd.z);
 
-        if (tm_vec3_dot(f_total, f_total) * 0.0025f < 0.00001f) {
+        float f_len = tm_vec3_dot(f_total, f_total);
+        if (f_len * 0.0025f < 0.00001f) {
             break;
         }
 
@@ -102,7 +103,7 @@ static bool dc_cell_vertex(const mag_voxel_region_t *region, int x, int y, int z
             if ((v[x + dx][y + dy][z] > 0) != (v[x + dx][y + dy][z + 1] > 0)) {
                 float distance = ADAPT(v[x + dx][y + dy][z], v[x + dx][y + dy][z + 1]);
                 changes[change_idx] = (tm_vec3_t) { .x = (float)(x + dx), .y = (float)(y + dy), .z = (float)z + distance };
-                normals[change_idx] = tm_vec3_lerp(n[x + dx][y + dy][z], n[x + dx][y + dy][z + 1], distance);
+                normals[change_idx] = tm_vec3_normalize(tm_vec3_lerp(n[x + dx][y + dy][z], n[x + dx][y + dy][z + 1], distance));
                 ++change_idx;
             }
         }
@@ -113,7 +114,7 @@ static bool dc_cell_vertex(const mag_voxel_region_t *region, int x, int y, int z
             if ((v[x + dx][y][z + dz] > 0) != (v[x + dx][y + 1][z + dz] > 0)) {
                 float distance = ADAPT(v[x + dx][y][z + dz], v[x + dx][y + 1][z + dz]);
                 changes[change_idx] = (tm_vec3_t) { .x = (float)(x + dx), .y = (float)y + distance, .z = (float)(z + dz) };
-                normals[change_idx] = tm_vec3_lerp(n[x + dx][y][z + dz], n[x + dx][y + 1][z + dz], distance);
+                normals[change_idx] = tm_vec3_normalize(tm_vec3_lerp(n[x + dx][y][z + dz], n[x + dx][y + 1][z + dz], distance));
                 ++change_idx;
             }
         }
@@ -124,7 +125,7 @@ static bool dc_cell_vertex(const mag_voxel_region_t *region, int x, int y, int z
             if ((v[x][y + dy][z + dz] > 0) != (v[x + 1][y + dy][z + dz] > 0)) {
                 float distance = ADAPT(v[x][y + dy][z + dz], v[x + 1][y + dy][z + dz]);
                 changes[change_idx] = (tm_vec3_t) { .x = (float)x + distance, .y = (float)(y + dy), .z = (float)(z + dz) };
-                normals[change_idx] = tm_vec3_lerp(n[x][y + dy][z + dz], n[x + 1][y + dy][z + dz], distance);
+                normals[change_idx] = tm_vec3_normalize(tm_vec3_lerp(n[x][y + dy][z + dz], n[x + 1][y + dy][z + dz], distance));
                 ++change_idx;
             }
         }
@@ -133,7 +134,17 @@ static bool dc_cell_vertex(const mag_voxel_region_t *region, int x, int y, int z
     if (change_idx <= 1)
         return false;
 
-    *vertex = find_vertex((float)x, (float)y, (float)z, changes, normals, change_idx);
+    float corner_signs[8] = {
+        v[x + 0][y + 0][z + 0] >= 0.f ? 1.f : -1.f,
+        v[x + 0][y + 0][z + 1] >= 0.f ? 1.f : -1.f,
+        v[x + 0][y + 1][z + 0] >= 0.f ? 1.f : -1.f,
+        v[x + 0][y + 1][z + 1] >= 0.f ? 1.f : -1.f,
+        v[x + 1][y + 0][z + 0] >= 0.f ? 1.f : -1.f,
+        v[x + 1][y + 0][z + 1] >= 0.f ? 1.f : -1.f,
+        v[x + 1][y + 1][z + 0] >= 0.f ? 1.f : -1.f,
+        v[x + 1][y + 1][z + 1] >= 0.f ? 1.f : -1.f,
+    };
+    *vertex = find_vertex((float)x, (float)y, (float)z, changes, normals, change_idx, corner_signs);
     return true;
 }
 
