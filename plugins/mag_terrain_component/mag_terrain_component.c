@@ -619,11 +619,14 @@ static void fill_bounding_volume_buffer(struct tm_component_manager_o *manager, 
     for (uint32_t i = 0; i != num_renderables; ++i) {
         mag_terrain_component_t *c = cdata[i];
 
-        const float size = (float)MAG_VOXEL_CHUNK_SIZE * c->region_data.cell_size;
+        const float size = (float)MAG_VOXEL_REGION_SIZE * c->region_data.cell_size;
+        const float margin = (float)MAG_VOXEL_MARGIN * c->region_data.cell_size;
+        const tm_vec3_t margin_vec = {margin, margin, margin};
+
         tm_mat44_from_translation_quaternion_scale(&dest->tm, (tm_vec3_t) { 0, 0, 0 }, (tm_vec4_t) { 0, 0, 0, 0 }, (tm_vec3_t) { 1, 1, 1 });
         dest->visibility_mask = c->visibility_mask;
-        dest->min = c->region_data.pos;
-        dest->max = (tm_vec3_t) { size, size, size };
+        dest->min = tm_vec3_sub(c->region_data.pos, margin_vec);
+        dest->max = tm_vec3_add(dest->min, (tm_vec3_t) { size, size, size });
         ++dest;
     }
 
