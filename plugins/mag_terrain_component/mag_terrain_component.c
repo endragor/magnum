@@ -15,6 +15,10 @@ static struct tm_the_truth_common_types_api *tm_the_truth_common_types_api;
 static struct tm_logger_api *tm_logger_api;
 static struct tm_visibility_flags_api *tm_visibility_flags_api;
 static struct tm_entity_commands_api *tm_entity_commands_api;
+static struct tm_simulation_api *tm_simulation_api;
+static struct tm_input_api *tm_input_api;
+static struct tm_camera_api *tm_camera_api;
+static struct tm_ui_api *tm_ui_api;
 
 static struct mag_voxel_api *mag_voxel_api;
 
@@ -23,12 +27,16 @@ static struct mag_voxel_api *mag_voxel_api;
 #include <foundation/api_registry.h>
 #include <foundation/bounding_volume.h>
 #include <foundation/buffer_format.h>
+#include <foundation/camera.h>
 #include <foundation/carray.inl>
 #include <foundation/error.h>
+#include <foundation/hash.inl>
+#include <foundation/input.h>
 #include <foundation/localizer.h>
 #include <foundation/log.h>
 #include <foundation/murmurhash64a.inl>
 #include <foundation/profiler.h>
+#include <foundation/rect.inl>
 #include <foundation/the_truth.h>
 #include <foundation/the_truth_types.h>
 #include <foundation/unit_test.h>
@@ -45,10 +53,14 @@ static struct mag_voxel_api *mag_voxel_api;
 #include <plugins/renderer/renderer.h>
 #include <plugins/renderer/resources.h>
 #include <plugins/shader_system/shader_system.h>
+#include <plugins/simulation/simulation.h>
+#include <plugins/simulation/simulation_entry.h>
 #include <plugins/the_machinery_shared/component_interfaces/editor_ui_interface.h>
 #include <plugins/the_machinery_shared/component_interfaces/render_interface.h>
 #include <plugins/the_machinery_shared/frustum_culling.h>
 #include <plugins/the_machinery_shared/render_context.h>
+#include <plugins/ui/ui.h>
+#include <plugins/ui/ui_custom.h>
 
 #include <foundation/math.inl>
 
@@ -69,6 +81,24 @@ enum {
 };
 
 #include "plugins/mag_voxel/mag_voxel.h"
+
+typedef enum op_type_t {
+    OP_UNION,
+    OP_SUBTRACT,
+} op_type_t;
+
+typedef enum op_primitive_t {
+    OP_SPHERE,
+} op_primitive_t;
+
+typedef struct op_t
+{
+    // TODO: use a more compact representation (half floats for size?)
+    uint8_t type;
+    uint8_t primitive;
+    tm_vec3_t pos;
+    tm_vec3_t size;
+} op_t;
 
 typedef struct region_data_t
 {
@@ -126,15 +156,74 @@ typedef struct aabb_t
     tm_vec3_t max;
 } aabb_t;
 
+static bool set_constant(tm_shader_io_o *io, tm_renderer_resource_command_buffer_o *res_buf, const tm_shader_constant_buffer_instance_t *instance, const char *name, const void *data, uint32_t data_size)
+{
+    tm_shader_constant_t constant;
+    uint32_t constant_offset;
+
+    if (tm_shader_api->lookup_constant(io, tm_murmur_hash_string(name), &constant, &constant_offset)) {
+        tm_shader_api->update_constants(io, res_buf, &(tm_shader_constant_update_t) { .instance_id = instance->instance_id, .constant_offset = constant_offset, .num_bytes = data_size, .data = data }, 1);
+        return true;
+    }
+
+    return false;
+}
+
+static bool set_resource(tm_shader_io_o *io, tm_renderer_resource_command_buffer_o *res_buf, tm_shader_resource_binder_instance_t *instance,
+    tm_strhash_t name, const tm_renderer_handle_t *resource_handle, const uint32_t *aspect_flags, uint32_t first_resource, uint32_t n_resources)
+{
+    tm_shader_resource_t resource;
+    uint32_t resource_slot;
+    if (tm_shader_api->lookup_resource(io, name, &resource, &resource_slot)) {
+        tm_shader_api->update_resources(io, res_buf, &(tm_shader_resource_update_t) { .instance_id = instance->instance_id, .resource_slot = resource_slot, .first_resource = first_resource, .num_resources = n_resources, .resources = resource_handle, .resources_view_aspect_flags = aspect_flags }, 1);
+        return true;
+    }
+    return false;
+}
+
 #define NATURAL_MAP(x) ((uint64_t)((x) < 0 ? (-(x)-1) * 2 + 1 : (x)*2))
 #define NATURAL_PAIR_MAP(x, y) (((x) + (y)) * ((x) + (y) + 1) / 2 + (y))
 
+static const float LOD_DISTANCES[] = {
+    64.f,
+    128.f,
+    256.f,
+    512.f,
+};
+
+static uint64_t region_key(tm_vec3_t start, float lod_size, uint64_t lod_i)
+{
+    uint64_t ux = NATURAL_MAP((int64_t)(start.x / lod_size));
+    uint64_t uy = NATURAL_MAP((int64_t)(start.y / lod_size));
+    uint64_t uz = NATURAL_MAP((int64_t)(start.z / lod_size));
+
+    return ((NATURAL_PAIR_MAP(NATURAL_PAIR_MAP(ux, uy), uz) << 3) | lod_i) + 1;
+}
+
+static void add_regions_from_aabb(region_data_t **result, const aabb_t *aabb, uint64_t lod_i, tm_temp_allocator_i *ta)
+{
+    float cell_size = 1.f;
+    for (uint64_t i = 0; i < lod_i; ++i) {
+        cell_size *= 2.f;
+    }
+
+    float lod_size = (float)MAG_VOXEL_CHUNK_SIZE * cell_size;
+    for (float x = aabb->min.x; x < aabb->max.x; x += lod_size) {
+        for (float y = aabb->min.y; y < aabb->max.y; y += lod_size) {
+            for (float z = aabb->min.z; z < aabb->max.z; z += lod_size) {
+                region_data_t region = {
+                    .pos = { x, y, z },
+                    .cell_size = cell_size,
+                    .key = region_key((tm_vec3_t) { x, y, z }, lod_size, lod_i),
+                };
+                tm_carray_temp_push(*result, region, ta);
+            }
+        }
+    }
+}
+
 static region_data_t *wanted_regions(tm_vec3_t camera_pos, tm_temp_allocator_i *ta)
 {
-    const float LOD_DISTANCES[] = {
-        64.f,
-        128.f,
-    };
 
     tm_vec3_t prev_min = { 0 };
     tm_vec3_t prev_max = { 0 };
@@ -144,7 +233,6 @@ static region_data_t *wanted_regions(tm_vec3_t camera_pos, tm_temp_allocator_i *
     region_data_t *result = NULL;
     for (uint64_t i = 0; i < TM_ARRAY_COUNT(LOD_DISTANCES); ++i) {
         tm_vec3_t lod_distance = { LOD_DISTANCES[i], LOD_DISTANCES[i], LOD_DISTANCES[i] };
-        float lod_size = (float)MAG_VOXEL_CHUNK_SIZE * cell_size;
         int64_t ilod_size = MAG_VOXEL_CHUNK_SIZE * icell_size;
         tm_vec3_t lod_min = floor_to(tm_vec3_sub(camera_pos, lod_distance), ilod_size * 2);
         tm_vec3_t lod_max = ceil_to(tm_vec3_add(camera_pos, lod_distance), ilod_size * 2);
@@ -169,24 +257,7 @@ static region_data_t *wanted_regions(tm_vec3_t camera_pos, tm_temp_allocator_i *
         }
 
         for (uint32_t ai = 0; ai < aabb_count; ++ai) {
-            const aabb_t *aabb = partial_aabbs + ai;
-            for (float x = aabb->min.x; x < aabb->max.x; x += lod_size) {
-                for (float y = aabb->min.y; y < aabb->max.y; y += lod_size) {
-                    for (float z = aabb->min.z; z < aabb->max.z; z += lod_size) {
-                        uint64_t ux = NATURAL_MAP((int64_t)(x / lod_size));
-                        uint64_t uy = NATURAL_MAP((int64_t)(y / lod_size));
-                        uint64_t uz = NATURAL_MAP((int64_t)(z / lod_size));
-
-                        uint64_t key = ((NATURAL_PAIR_MAP(NATURAL_PAIR_MAP(ux, uy), uz) << 3) | i) + 1;
-                        region_data_t region = {
-                            .pos = { x, y, z },
-                            .cell_size = cell_size,
-                            .key = key,
-                        };
-                        tm_carray_temp_push(result, region, ta);
-                    }
-                }
-            }
+            add_regions_from_aabb(&result, partial_aabbs + ai, i, ta);
         }
 
         prev_min = lod_min;
@@ -211,6 +282,13 @@ typedef struct mag_terrain_component_manager_t
     tm_shader_repository_o *shader_repo;
 
     tm_component_mask_t component_mask;
+
+    struct TM_HASH_T(uint64_t, mag_terrain_component_t *) component_map;
+
+    // TODO: optimize to avoid copying on growth
+    /* carray */ op_t *ops;
+    uint64_t applied_op_count;
+
 } mag_terrain_component_manager_t;
 
 static float properties_ui(struct tm_properties_ui_args_t *args, tm_rect_t item_rect, tm_tt_id_t object);
@@ -260,6 +338,149 @@ static bool load_asset(tm_component_manager_o *manager, struct tm_entity_command
 
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
     return true;
+}
+
+static aabb_t adjust_aabb_to_lod(const aabb_t *aabb, int64_t lod_size)
+{
+    return (aabb_t) { floor_to(aabb->min, lod_size), ceil_to(aabb->max, lod_size) };
+}
+
+static aabb_t op_aabb(const op_t *op)
+{
+    tm_vec3_t half_size = tm_vec3_mul(op->size, 0.5f);
+    return (aabb_t) { tm_vec3_sub(op->pos, half_size), tm_vec3_add(op->pos, half_size) };
+}
+
+static void apply_op_to_component(tm_renderer_backend_i *rb, tm_shader_repository_o *shader_repo, const mag_terrain_component_t *c, const op_t *op, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
+{
+    if (!c->densities_handle.resource)
+        return;
+
+    TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
+
+    // TODO: reuse these buffers
+
+    tm_shader_resource_binder_instance_t rbinder;
+    tm_shader_constant_buffer_instance_t cbuf;
+
+    tm_shader_o *shader = tm_shader_repository_api->lookup_shader(shader_repo, TM_STATIC_HASH("magnum_terrain_operations", 0x4e0fc94d36751938ULL));
+    tm_shader_io_o *io = tm_shader_api->shader_io(shader);
+
+    tm_shader_api->create_resource_binder_instances(io, 1, &rbinder);
+    tm_shader_api->create_constant_buffer_instances(io, 1, &cbuf);
+
+    uint32_t op_type = op->type;
+    uint32_t op_primitive = op->primitive;
+
+    set_constant(io, res_buf, &cbuf, "region_pos", &c->region_data.pos, sizeof(c->region_data.pos));
+    set_constant(io, res_buf, &cbuf, "cell_size", &c->region_data.cell_size, sizeof(c->region_data.cell_size));
+    set_constant(io, res_buf, &cbuf, "operation", &op_type, sizeof(op_type));
+    set_constant(io, res_buf, &cbuf, "primitive_type", &op_primitive, sizeof(op_primitive));
+    set_constant(io, res_buf, &cbuf, "primitive_position", &op->pos, sizeof(op->pos));
+    set_constant(io, res_buf, &cbuf, "primitive_size", &op->size, sizeof(op->size));
+
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("densities", 0x9d97839d5465b483ULL), &c->densities_handle, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("normals", 0x80b4d6fd3ed93beULL), &c->normals_handle, 0, 0, 1);
+
+    tm_renderer_shader_info_t shader_info;
+    tm_shader_system_context_o *shader_context = tm_shader_system_api->create_context(a, NULL);
+    if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, &cbuf, &rbinder, 1, &shader_info)) {
+        tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { 1, MAG_VOXEL_REGION_SIZE, MAG_VOXEL_REGION_SIZE } }, &shader_info, 1);
+        ++*sort_key;
+    }
+
+    uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
+    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = c->densities_handle, .source_state = state, .destination_state = state }, 1);
+    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = c->normals_handle, .source_state = state, .destination_state = state }, 1);
+    ++*sort_key;
+
+    tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
+    tm_shader_api->destroy_constant_buffer_instances(io, &cbuf, 1);
+
+    TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
+}
+
+static void generate_mesh(tm_renderer_backend_i *rb, tm_shader_repository_o *shader_repo, const mag_terrain_component_t *c, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
+{
+    TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
+
+    tm_renderer_draw_indexed_command_t *draw_command;
+    tm_renderer_api->tm_renderer_resource_command_buffer_api->update_buffer(res_buf,
+        c->region_indirect, 0, sizeof(*draw_command),
+        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, 0, &draw_command);
+    *draw_command = (tm_renderer_draw_indexed_command_t) { .num_instances = 1 };
+
+    tm_shader_resource_binder_instance_t rbinder;
+    tm_shader_constant_buffer_instance_t cbuf;
+
+    tm_shader_o *shader = tm_shader_repository_api->lookup_shader(shader_repo, TM_STATIC_HASH("magnum_terrain_gen_region_with_mesh", 0xc427e87002185b98ULL));
+    tm_shader_io_o *io = tm_shader_api->shader_io(shader);
+
+    tm_shader_api->create_resource_binder_instances(io, 1, &rbinder);
+    tm_shader_api->create_constant_buffer_instances(io, 1, &cbuf);
+
+    set_constant(io, res_buf, &cbuf, "region_pos", &c->region_data.pos, sizeof(c->region_data.pos));
+    set_constant(io, res_buf, &cbuf, "cell_size", &c->region_data.cell_size, sizeof(c->region_data.cell_size));
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("densities", 0x9d97839d5465b483ULL), &c->densities_handle, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("normals", 0x80b4d6fd3ed93beULL), &c->normals_handle, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("region_indirect", 0xe7e22c1a4906be7fULL), &c->region_indirect, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("vertices", 0x3288dd4327525f9aULL), &c->mesh.vbuf, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("vertex_normals", 0x45b9b61b4d82ac56ULL), &c->nbuf, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("triangles", 0x72976bf8d13d4449ULL), &c->mesh.ibuf, 0, 0, 1);
+
+    tm_renderer_shader_info_t shader_info;
+    tm_shader_system_context_o *shader_context = tm_shader_system_api->create_context(a, NULL);
+    if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, &cbuf, &rbinder, 1, &shader_info)) {
+        tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { 1, MAG_VOXEL_REGION_SIZE - 1, MAG_VOXEL_REGION_SIZE - 1 } }, &shader_info, 1);
+        *sort_key += 1;
+    }
+
+    uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
+    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = c->mesh.vbuf, .source_state = state, .destination_state = state }, 1);
+    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = c->region_indirect, .source_state = state, .destination_state = TM_RENDERER_RESOURCE_STATE_INDIRECT_ARGUMENT }, 1);
+    *sort_key += 1;
+
+    tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
+    tm_shader_api->destroy_constant_buffer_instances(io, &cbuf, 1);
+
+    TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
+}
+
+static void apply_op(mag_terrain_component_manager_t *man, const op_t *op, tm_engine_update_set_t *data)
+{
+    TM_INIT_TEMP_ALLOCATOR(ta);
+
+    aabb_t aabb = op_aabb(op);
+    region_data_t *affected_regions = NULL;
+
+    int64_t lod_size = MAG_VOXEL_CHUNK_SIZE;
+    for (uint64_t ilod = 0; ilod < TM_ARRAY_COUNT(LOD_DISTANCES); ++ilod) {
+        aabb_t lod_aabb = adjust_aabb_to_lod(&aabb, lod_size);
+        lod_size *= 2;
+        add_regions_from_aabb(&affected_regions, &lod_aabb, ilod, ta);
+    }
+
+    tm_renderer_command_buffer_o *cmd_buf;
+    man->backend->create_command_buffers(man->backend->inst, &cmd_buf, 1);
+    tm_renderer_resource_command_buffer_o *res_buf;
+    man->backend->create_resource_command_buffers(man->backend->inst, &res_buf, 1);
+
+    for (uint64_t ri = 0; ri < tm_carray_size(affected_regions); ++ri) {
+        uint64_t key = affected_regions[ri].key;
+        mag_terrain_component_t *c = tm_hash_get(&man->component_map, key);
+        if (c) {
+            uint64_t sort_key = 0;
+            apply_op_to_component(man->backend, man->shader_repo, c, op, cmd_buf, res_buf, &sort_key);
+            generate_mesh(man->backend, man->shader_repo, c, cmd_buf, res_buf, &sort_key);
+        }
+    }
+
+    man->backend->submit_resource_command_buffers(man->backend->inst, &res_buf, 1);
+    man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
+    man->backend->submit_command_buffers(man->backend->inst, &cmd_buf, 1);
+    man->backend->destroy_command_buffers(man->backend->inst, &cmd_buf, 1);
+
+    TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
 
 static void add(tm_component_manager_o *manager, struct tm_entity_commands_o *commands, tm_entity_t e, void *data)
@@ -319,6 +540,9 @@ static void destroy(tm_component_manager_o *manager)
     const tm_component_type_t terrain_component = tm_entity_api->lookup_component_type(man->ctx, MAG_TT_TYPE_HASH__TERRAIN_COMPONENT);
     tm_entity_api->call_remove_on_all_entities(man->ctx, terrain_component);
 
+    tm_carray_free(man->ops, &man->allocator);
+    tm_hash_free(&man->component_map);
+
     tm_entity_context_o *ctx = man->ctx;
     tm_allocator_i a = man->allocator;
     tm_free(&a, man, sizeof(*man));
@@ -342,6 +566,7 @@ static void create_mag_terrain_component(tm_entity_context_o *ctx)
         .backend = backend,
         .shader_repo = shader_repo,
     };
+    manager->component_map.allocator = &manager->allocator;
 
     const tm_component_i component = {
         .name = MAG_TT_TYPE__TERRAIN_COMPONENT,
@@ -374,31 +599,6 @@ static const char *get_type_display_name(void)
     return TM_LOCALIZE("Voxel Terrain Component");
 }
 
-static bool set_constant(tm_shader_io_o *io, tm_renderer_resource_command_buffer_o *res_buf, const tm_shader_constant_buffer_instance_t *instance, const char *name, const void *data, uint32_t data_size)
-{
-    tm_shader_constant_t constant;
-    uint32_t constant_offset;
-
-    if (tm_shader_api->lookup_constant(io, tm_murmur_hash_string(name), &constant, &constant_offset)) {
-        tm_shader_api->update_constants(io, res_buf, &(tm_shader_constant_update_t) { .instance_id = instance->instance_id, .constant_offset = constant_offset, .num_bytes = data_size, .data = data }, 1);
-        return true;
-    }
-
-    return false;
-}
-
-static bool set_resource(tm_shader_io_o *io, tm_renderer_resource_command_buffer_o *res_buf, tm_shader_resource_binder_instance_t *instance,
-    tm_strhash_t name, const tm_renderer_handle_t *resource_handle, const uint32_t *aspect_flags, uint32_t first_resource, uint32_t n_resources)
-{
-    tm_shader_resource_t resource;
-    uint32_t resource_slot;
-    if (tm_shader_api->lookup_resource(io, name, &resource, &resource_slot)) {
-        tm_shader_api->update_resources(io, res_buf, &(tm_shader_resource_update_t) { .instance_id = instance->instance_id, .resource_slot = resource_slot, .first_resource = first_resource, .num_resources = n_resources, .resources = resource_handle, .resources_view_aspect_flags = aspect_flags }, 1);
-        return true;
-    }
-    return false;
-}
-
 static void generate_sdf(tm_renderer_backend_i *rb, tm_shader_repository_o *shader_repo, const mag_terrain_component_t *c, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
 {
     TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
@@ -424,46 +624,6 @@ static void generate_sdf(tm_renderer_backend_i *rb, tm_shader_repository_o *shad
     uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
     tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = c->densities_handle, .source_state = state, .destination_state = state }, 1);
     *sort_key += 1;
-    tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
-    tm_shader_api->destroy_constant_buffer_instances(io, &cbuf, 1);
-
-    TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
-}
-
-static void generate_mesh(tm_renderer_backend_i *rb, tm_shader_repository_o *shader_repo, const mag_terrain_component_t *c, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
-{
-    TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
-
-    tm_shader_resource_binder_instance_t rbinder;
-    tm_shader_constant_buffer_instance_t cbuf;
-
-    tm_shader_o *shader = tm_shader_repository_api->lookup_shader(shader_repo, TM_STATIC_HASH("magnum_terrain_gen_region_with_mesh", 0xc427e87002185b98ULL));
-    tm_shader_io_o *io = tm_shader_api->shader_io(shader);
-
-    tm_shader_api->create_resource_binder_instances(io, 1, &rbinder);
-    tm_shader_api->create_constant_buffer_instances(io, 1, &cbuf);
-
-    set_constant(io, res_buf, &cbuf, "region_pos", &c->region_data.pos, sizeof(c->region_data.pos));
-    set_constant(io, res_buf, &cbuf, "cell_size", &c->region_data.cell_size, sizeof(c->region_data.cell_size));
-    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("densities", 0x9d97839d5465b483ULL), &c->densities_handle, 0, 0, 1);
-    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("normals", 0x80b4d6fd3ed93beULL), &c->normals_handle, 0, 0, 1);
-    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("region_indirect", 0xe7e22c1a4906be7fULL), &c->region_indirect, 0, 0, 1);
-    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("vertices", 0x3288dd4327525f9aULL), &c->mesh.vbuf, 0, 0, 1);
-    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("vertex_normals", 0x45b9b61b4d82ac56ULL), &c->nbuf, 0, 0, 1);
-    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("triangles", 0x72976bf8d13d4449ULL), &c->mesh.ibuf, 0, 0, 1);
-
-    tm_renderer_shader_info_t shader_info;
-    tm_shader_system_context_o *shader_context = tm_shader_system_api->create_context(a, NULL);
-    if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, &cbuf, &rbinder, 1, &shader_info)) {
-        tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { 1, MAG_VOXEL_REGION_SIZE - 1, MAG_VOXEL_REGION_SIZE - 1 } }, &shader_info, 1);
-        *sort_key += 1;
-    }
-
-    uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
-    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = c->mesh.vbuf, .source_state = state, .destination_state = state }, 1);
-    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = c->region_indirect, .source_state = state, .destination_state = TM_RENDERER_RESOURCE_STATE_INDIRECT_ARGUMENT }, 1);
-    *sort_key += 1;
-
     tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
     tm_shader_api->destroy_constant_buffer_instances(io, &cbuf, 1);
 
@@ -502,7 +662,7 @@ static void bind_vertex_system_resources(tm_shader_io_o *io, mag_terrain_compone
         &c->cbuffer.instance_id, (const void **)&cbuf, 0, sizeof(tm_shader_vertex_buffer_system_t), 1);
 }
 
-static void generate_region_gpu(tm_renderer_backend_i *rb, tm_shader_repository_o *shader_repo, tm_shader_io_o *vertex_system_io, mag_terrain_component_t *c)
+static void generate_region_gpu(tm_renderer_backend_i *rb, tm_shader_repository_o *shader_repo, tm_shader_io_o *vertex_system_io, mag_terrain_component_t *c, const op_t *ops)
 {
     tm_renderer_command_buffer_o *cmd_buf;
     rb->create_command_buffers(rb->inst, &cmd_buf, 1);
@@ -511,32 +671,35 @@ static void generate_region_gpu(tm_renderer_backend_i *rb, tm_shader_repository_
 
     const uint32_t REGION_SIZE = MAG_VOXEL_REGION_SIZE * MAG_VOXEL_REGION_SIZE * MAG_VOXEL_REGION_SIZE;
 
-    c->densities_handle = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
-        &(tm_renderer_buffer_desc_t) { .size = sizeof(float) * REGION_SIZE, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_densities" },
-        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
-    c->normals_handle = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
-        &(tm_renderer_buffer_desc_t) { .size = sizeof(tm_vec3_t) * REGION_SIZE, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_normals" },
-        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
-    tm_renderer_draw_indexed_command_t *draw_command;
-    c->region_indirect = tm_renderer_api->tm_renderer_resource_command_buffer_api->map_create_buffer(res_buf,
-        &(tm_renderer_buffer_desc_t) { .size = sizeof(tm_renderer_draw_indexed_command_t), .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV | TM_RENDERER_BUFFER_USAGE_INDIRECT | TM_RENDERER_BUFFER_USAGE_UPDATABLE, .debug_tag = "mag_region_indirect" },
-        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, 0, &draw_command);
-    c->mesh.vbuf = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
-        &(tm_renderer_buffer_desc_t) { .size = sizeof(tm_vec3_t) * REGION_SIZE, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV | TM_RENDERER_BUFFER_USAGE_ACCELERATION_STRUCTURE, .debug_tag = "mag_region_vertices" },
-        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
-    c->nbuf = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
-        &(tm_renderer_buffer_desc_t) { .size = sizeof(tm_vec3_t) * REGION_SIZE, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV | TM_RENDERER_BUFFER_USAGE_ACCELERATION_STRUCTURE, .debug_tag = "mag_region_vertex_normals" },
-        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
-    c->mesh.ibuf = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
-        &(tm_renderer_buffer_desc_t) { .size = sizeof(uint16_t) * 6 * 3 * REGION_SIZE, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV | TM_RENDERER_BUFFER_USAGE_ACCELERATION_STRUCTURE | TM_RENDERER_BUFFER_USAGE_INDEX, .debug_tag = "mag_region_triangles" },
-        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
+    if (!c->densities_handle.resource) {
+        c->densities_handle = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+            &(tm_renderer_buffer_desc_t) { .size = sizeof(float) * REGION_SIZE, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_densities" },
+            TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
+        c->normals_handle = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+            &(tm_renderer_buffer_desc_t) { .size = sizeof(tm_vec3_t) * REGION_SIZE, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_normals" },
+            TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
+        c->region_indirect = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+            &(tm_renderer_buffer_desc_t) { .size = sizeof(tm_renderer_draw_indexed_command_t), .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV | TM_RENDERER_BUFFER_USAGE_INDIRECT | TM_RENDERER_BUFFER_USAGE_UPDATABLE, .debug_tag = "mag_region_indirect" },
+            TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
+        c->mesh.vbuf = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+            &(tm_renderer_buffer_desc_t) { .size = sizeof(tm_vec3_t) * REGION_SIZE, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV | TM_RENDERER_BUFFER_USAGE_ACCELERATION_STRUCTURE, .debug_tag = "mag_region_vertices" },
+            TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
+        c->nbuf = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+            &(tm_renderer_buffer_desc_t) { .size = sizeof(tm_vec3_t) * REGION_SIZE, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV | TM_RENDERER_BUFFER_USAGE_ACCELERATION_STRUCTURE, .debug_tag = "mag_region_vertex_normals" },
+            TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
+        c->mesh.ibuf = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+            &(tm_renderer_buffer_desc_t) { .size = sizeof(uint16_t) * 6 * 3 * REGION_SIZE, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV | TM_RENDERER_BUFFER_USAGE_ACCELERATION_STRUCTURE | TM_RENDERER_BUFFER_USAGE_INDEX, .debug_tag = "mag_region_triangles" },
+            TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
 
-    bind_vertex_system_resources(vertex_system_io, c, res_buf);
+        bind_vertex_system_resources(vertex_system_io, c, res_buf);
+    }
 
-    *draw_command = (tm_renderer_draw_indexed_command_t) { .num_instances = 1 };
     uint64_t sort_key = 0;
 
     generate_sdf(rb, shader_repo, c, cmd_buf, res_buf, &sort_key);
+    for (uint64_t i = 0; i < tm_carray_size(ops); ++i) {
+        apply_op_to_component(rb, shader_repo, c, ops + i, cmd_buf, res_buf, &sort_key);
+    }
     generate_mesh(rb, shader_repo, c, cmd_buf, res_buf, &sort_key);
 
     rb->submit_resource_command_buffers(rb->inst, &res_buf, 1);
@@ -592,12 +755,11 @@ static void dual_contour_cpu(mag_terrain_component_t *c, mag_terrain_component_m
 static void recreate_mesh(mag_terrain_component_t *c, mag_terrain_component_manager_t *man)
 {
     TM_PROFILER_BEGIN_FUNC_SCOPE();
-    destroy_mesh(c, man);
 
     tm_shader_system_o *vertex_buffer_system = tm_shader_repository_api->lookup_system(man->shader_repo, tm_murmur_hash_string("vertex_buffer_system"));
     tm_shader_io_o *vertex_buffer_io = tm_shader_api->system_io(vertex_buffer_system);
 
-    generate_region_gpu(man->backend, man->shader_repo, vertex_buffer_io, c);
+    generate_region_gpu(man->backend, man->shader_repo, vertex_buffer_io, c, man->ops);
     // dual_contour_cpu(c, man, vertex_buffer_io, man->backend);
 
     TM_PROFILER_END_FUNC_SCOPE();
@@ -621,7 +783,7 @@ static void fill_bounding_volume_buffer(struct tm_component_manager_o *manager, 
 
         const float size = (float)MAG_VOXEL_REGION_SIZE * c->region_data.cell_size;
         const float margin = (float)MAG_VOXEL_MARGIN * c->region_data.cell_size;
-        const tm_vec3_t margin_vec = {margin, margin, margin};
+        const tm_vec3_t margin_vec = { margin, margin, margin };
 
         tm_mat44_from_translation_quaternion_scale(&dest->tm, (tm_vec3_t) { 0, 0, 0 }, (tm_vec4_t) { 0, 0, 0, 0 }, (tm_vec3_t) { 1, 1, 1 });
         dest->visibility_mask = c->visibility_mask;
@@ -799,6 +961,11 @@ void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *data, str
         return;
     region_data_t *regions_to_render = wanted_regions(camera_transform->pos, ta);
 
+    for (uint64_t i = man->applied_op_count; i < tm_carray_size(man->ops); ++i) {
+        apply_op(man, man->ops + i, data);
+    }
+    man->applied_op_count = tm_carray_size(man->ops);
+
     for (tm_engine_update_array_t *a = data->arrays; a < data->arrays + data->num_arrays; ++a) {
         mag_terrain_component_t *components = a->components[0];
 
@@ -827,10 +994,11 @@ void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *data, str
             if (!existing) {
                 if (tm_carray_size(regions_to_render)) {
                     c->region_data = tm_carray_pop(regions_to_render);
+                    tm_hash_add(&man->component_map, c->region_data.key, c);
                     recreate_mesh(c, man);
                 } else {
+                    tm_hash_remove(&man->component_map, c->region_data.key);
                     c->region_data.key = 0;
-                    destroy_mesh(c, man);
                 }
             }
         }
@@ -843,6 +1011,199 @@ void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *data, str
     }
 
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
+}
+
+#define CODE_ABOVE (1 << 0)
+#define CODE_BELOW (1 << 1)
+#define CODE_RIGHT (1 << 2)
+#define CODE_LEFT (1 << 3)
+#define CODE_BACK (1 << 4)
+#define CODE_FRONT (1 << 5)
+
+static uint8_t aabb_point_code(const aabb_t *aabb, const tm_vec3_t *p)
+{
+    uint8_t code = 0;
+
+    code |= (p->y > aabb->max.y) ? CODE_ABOVE : 0;
+    code |= (p->y < aabb->min.y) ? CODE_BELOW : 0;
+    code |= (p->x > aabb->max.x) ? CODE_RIGHT : 0;
+    code |= (p->x < aabb->min.x) ? CODE_LEFT : 0;
+    code |= (p->z > aabb->max.z) ? CODE_BACK : 0;
+    code |= (p->z < aabb->min.z) ? CODE_FRONT : 0;
+
+    return code;
+}
+
+static bool aabb_segment_intersect(const aabb_t *aabb, tm_vec3_t start, tm_vec3_t end)
+{
+    // Cohen-Sutherland algorithm
+    uint8_t code_start = aabb_point_code(aabb, &start);
+    uint8_t code_end = aabb_point_code(aabb, &end);
+
+    while (true) {
+        if (!code_start || !code_end) {
+            // one of the points is inside
+            return true;
+        }
+
+        if (code_start & code_end) {
+            return false;
+        }
+
+        uint8_t out_code = code_start > code_end ? code_start : code_end;
+
+        tm_vec3_t new;
+        if (out_code & CODE_ABOVE) {
+            new.y = aabb->max.y;
+            float t = (aabb->max.y - start.y) / (end.y - start.y);
+            new.x = start.x + (end.x - start.x) * t;
+            new.z = start.z + (end.z - start.z) * t;
+        } else if (out_code & CODE_BELOW) {
+            new.y = aabb->min.y;
+            float t = (aabb->min.y - start.y) / (end.y - start.y);
+            new.x = start.x + (end.x - start.x) * t;
+            new.z = start.z + (end.z - start.z) * t;
+        } else if (out_code & CODE_LEFT) {
+            new.x = aabb->min.x;
+            float t = (aabb->min.x - start.x) / (end.x - start.x);
+            new.y = start.y + (end.y - start.y) * t;
+            new.z = start.z + (end.z - start.z) * t;
+        } else if (out_code & CODE_RIGHT) {
+            new.x = aabb->max.x;
+            float t = (aabb->max.x - start.x) / (end.x - start.x);
+            new.y = start.y + (end.y - start.y) * t;
+            new.z = start.z + (end.z - start.z) * t;
+        } else if (out_code & CODE_FRONT) {
+            new.z = aabb->min.z;
+            float t = (aabb->min.z - start.z) / (end.z - start.z);
+            new.x = start.x + (end.x - start.x) * t;
+            new.y = start.y + (end.y - start.y) * t;
+        } else if (out_code & CODE_BACK) {
+            new.z = aabb->max.z;
+            float t = (aabb->max.z - start.z) / (end.z - start.z);
+            new.x = start.x + (end.x - start.x) * t;
+            new.y = start.y + (end.y - start.y) * t;
+        } else {
+            // won't really get here, but otherwise the compiler complains
+            // about the uninitialized variable
+            return true;
+        }
+
+        if (out_code == code_start) {
+            start = new;
+            code_start = aabb_point_code(aabb, &start);
+        } else {
+            end = new;
+            code_end = aabb_point_code(aabb, &end);
+        }
+    }
+}
+
+static bool cast_ray(mag_terrain_component_manager_t *man, tm_vec3_t ray_start, tm_vec3_t ray_dir, float max_distance, float *hit_distance)
+{
+    TM_ASSERT(max_distance < (float)MAG_VOXEL_CHUNK_SIZE, tm_error_api->def, "max ray distance (%f) beyond region size (%f) is not supported", max_distance, (float)MAG_VOXEL_CHUNK_SIZE);
+    tm_vec3_t chunk_size = { (float)MAG_VOXEL_CHUNK_SIZE, (float)MAG_VOXEL_CHUNK_SIZE, (float)MAG_VOXEL_CHUNK_SIZE };
+
+    tm_renderer_handle_t region_densities[5];
+    tm_vec3_t region_positions[5];
+    uint32_t region_count = 0;
+
+    tm_vec3_t min = tm_vec3_sub(floor_to(ray_start, MAG_VOXEL_CHUNK_SIZE), chunk_size);
+    tm_vec3_t max = tm_vec3_add(ceil_to(ray_start, MAG_VOXEL_CHUNK_SIZE), chunk_size);
+
+    tm_vec3_t segment_end = tm_vec3_add(ray_start, tm_vec3_mul(ray_dir, max_distance));
+
+    for (float x = min.x; x < max.x; x += MAG_VOXEL_CHUNK_SIZE) {
+        for (float y = min.y; y < max.y; y += MAG_VOXEL_CHUNK_SIZE) {
+            for (float z = min.z; z < max.z; z += MAG_VOXEL_CHUNK_SIZE) {
+                tm_vec3_t region_min = { x, y, z };
+                aabb_t aabb = { region_min, tm_vec3_add(region_min, chunk_size) };
+                if (aabb_segment_intersect(&aabb, ray_start, segment_end)) {
+                    uint64_t key = region_key(region_min, (float)MAG_VOXEL_CHUNK_SIZE, 0);
+                    mag_terrain_component_t *c = tm_hash_get(&man->component_map, key);
+                    if (!c)
+                        return false;
+                    region_densities[region_count] = c->densities_handle;
+                    region_positions[region_count] = region_min;
+                    ++region_count;
+                    if (region_count > 4)
+                        goto check_count;
+                }
+            }
+        }
+    }
+
+check_count:
+    bool count_ok = TM_ASSERT(region_count > 0 && region_count <= 4, tm_error_api->def,
+        "Got ray (%f, %f, %f) -> (%f, %f, %f) intersecting %lu regions. How the hell?",
+        ray_start.x, ray_start.y, ray_start.z, segment_end.x, segment_end.y, segment_end.z, region_count);
+
+    if (!count_ok)
+        return false;
+
+    TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
+
+    tm_renderer_backend_i *rb = man->backend;
+
+    tm_renderer_command_buffer_o *cmd_buf;
+    rb->create_command_buffers(rb->inst, &cmd_buf, 1);
+    tm_renderer_resource_command_buffer_o *res_buf;
+    rb->create_resource_command_buffers(rb->inst, &res_buf, 1);
+
+    // TODO: cache this buffer and other shader data
+    tm_renderer_handle_t result_handle = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+        &(tm_renderer_buffer_desc_t) { .size = sizeof(float), .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_ray_cast" },
+        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
+
+    tm_shader_o *shader = tm_shader_repository_api->lookup_shader(man->shader_repo, TM_STATIC_HASH("magnum_raycast", 0xc7699175374f215fULL));
+    tm_shader_io_o *io = tm_shader_api->shader_io(shader);
+
+    tm_shader_resource_binder_instance_t rbinder;
+    tm_shader_constant_buffer_instance_t cbuf;
+    tm_shader_api->create_resource_binder_instances(io, 1, &rbinder);
+    tm_shader_api->create_constant_buffer_instances(io, 1, &cbuf);
+
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("region_densities", 0x6b41b51de143171cULL), region_densities, 0, 0, region_count);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("ray_hit", 0x8afc43bd9fd77461ULL), &result_handle, 0, 0, 1);
+
+    set_constant(io, res_buf, &cbuf, "region_positions", region_positions, region_count * sizeof(region_positions[0]));
+    set_constant(io, res_buf, &cbuf, "region_count", &region_count, sizeof(region_count));
+    set_constant(io, res_buf, &cbuf, "ray_start", &ray_start, sizeof(ray_start));
+    set_constant(io, res_buf, &cbuf, "ray_dir", &ray_dir, sizeof(ray_dir));
+    set_constant(io, res_buf, &cbuf, "ray_max_length", &max_distance, sizeof(max_distance));
+
+    tm_renderer_shader_info_t shader_info;
+    tm_shader_system_context_o *shader_context = tm_shader_system_api->create_context(a, NULL);
+    if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, &cbuf, &rbinder, 1, &shader_info)) {
+        uint64_t zero_sort_key = 0;
+        tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, &zero_sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { 1, 1, 1 } }, &shader_info, 1);
+    }
+    tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
+    tm_shader_api->destroy_constant_buffer_instances(io, &cbuf, 1);
+
+    uint64_t sort_key = UINT64_MAX;
+    tm_renderer_api->tm_renderer_command_buffer_api->bind_queue(cmd_buf, sort_key, &(tm_renderer_queue_bind_t) { .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL });
+    uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
+
+    uint32_t rr = tm_renderer_api->tm_renderer_command_buffer_api->read_buffer(cmd_buf, sort_key, &(tm_renderer_read_buffer_t) { .resource_handle = result_handle, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, .resource_state = state, .resource_queue = TM_RENDERER_QUEUE_GRAPHICS, .bits = hit_distance, .size = sizeof(float) });
+
+    rb->submit_resource_command_buffers(rb->inst, &res_buf, 1);
+    rb->destroy_resource_command_buffers(rb->inst, &res_buf, 1);
+    rb->submit_command_buffers(rb->inst, &cmd_buf, 1);
+    rb->destroy_command_buffers(rb->inst, &cmd_buf, 1);
+
+    // TODO: do something with this blocking
+    while (!rb->read_complete(rb->inst, rr, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL))
+        ;
+
+    rb->create_resource_command_buffers(rb->inst, &res_buf, 1);
+    tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, result_handle);
+    rb->submit_resource_command_buffers(rb->inst, &res_buf, 1);
+    rb->destroy_resource_command_buffers(rb->inst, &res_buf, 1);
+
+    TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
+
+    return *hit_distance != -9999.f;
 }
 
 static void entity_simulation__register(struct tm_entity_context_o *ctx)
@@ -874,6 +1235,93 @@ static void entity_simulation__register(struct tm_entity_context_o *ctx)
     tm_entity_api->register_engine(ctx, &mirror_sound_sources);
 }
 
+#define MAX_OPS_PER_SECOND 5
+#define MAX_SCULPT_DISTANCE 31.0
+
+typedef struct tm_simulation_state_o
+{
+    tm_allocator_i *allocator;
+    tm_simulation_o *simulation_ctx;
+    tm_entity_context_o *entity_ctx;
+
+    mag_terrain_component_manager_t *terrain_mgr;
+
+    double last_op_time;
+} tm_simulation_state_o;
+
+static void private__cursor_line(const tm_camera_t *camera, tm_vec2_t mouse_pos, tm_rect_t viewport_r, tm_vec3_t *cursor_pos, tm_vec3_t *cursor_dir)
+{
+    const tm_vec3_t cursor[2] = { { mouse_pos.x, mouse_pos.y, 0 }, { mouse_pos.x, mouse_pos.y, 1 } };
+    tm_vec3_t cursor_world[2];
+    tm_camera_api->screen_to_world(camera, TM_CAMERA_TRANSFORM_DEFAULT, viewport_r, cursor, cursor_world, 2);
+    *cursor_pos = cursor_world[0];
+    *cursor_dir = tm_vec3_normalize(tm_vec3_sub(cursor_world[1], cursor_world[0]));
+}
+
+static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
+{
+    if (!args->ui || args->time - state->last_op_time < 1.0 / MAX_OPS_PER_SECOND)
+        return;
+
+    tm_ui_buffers_t uib = tm_ui_api->buffers(args->ui);
+    if (!uib.input->left_mouse_is_down)
+        return;
+
+    if (!tm_vec2_in_rect(uib.input->mouse_pos, args->rect))
+        return;
+
+    // tm_vec2_t cursor_screen_pos = { uib.input->mouse_pos.x - args->rect.x, uib.input->mouse_pos.y - args->rect.y };
+    const tm_camera_t *camera = tm_entity_api->get_blackboard_ptr(state->entity_ctx, TM_ENTITY_BB__CAMERA);
+    if (!camera)
+        return;
+
+    tm_vec3_t cursor_pos;
+    tm_vec3_t cursor_dir;
+    private__cursor_line(camera, uib.input->mouse_pos, args->rect, &cursor_pos, &cursor_dir);
+
+    float hit_length;
+    if (cast_ray(state->terrain_mgr, cursor_pos, cursor_dir, MAX_SCULPT_DISTANCE, &hit_length)) {
+        state->last_op_time = args->time;
+        op_t op = {
+            .pos = tm_vec3_add(cursor_pos, tm_vec3_mul(cursor_dir, hit_length)),
+            .size = { 2.f, 1.f, 1.f },
+            .primitive = OP_SPHERE,
+            .type = OP_UNION,
+        };
+        tm_carray_push(state->terrain_mgr->ops, op, &state->terrain_mgr->allocator);
+    }
+}
+
+static tm_simulation_state_o *start(tm_simulation_start_args_t *args)
+{
+    tm_simulation_state_o *state = tm_alloc(args->allocator, sizeof(*state));
+    *state = (tm_simulation_state_o) {
+        .allocator = args->allocator,
+        .entity_ctx = args->entity_ctx,
+        .simulation_ctx = args->simulation_ctx,
+        .last_op_time = -1.0 / MAX_OPS_PER_SECOND,
+    };
+
+    tm_component_type_t terrain_component = tm_entity_api->lookup_component_type(state->entity_ctx, MAG_TT_TYPE_HASH__TERRAIN_COMPONENT);
+    state->terrain_mgr = (mag_terrain_component_manager_t *)tm_entity_api->component_manager(state->entity_ctx, terrain_component);
+
+    return state;
+}
+
+static void stop(tm_simulation_state_o *state, struct tm_entity_commands_o *commands)
+{
+    tm_allocator_i a = *state->allocator;
+    tm_free(&a, state, sizeof(*state));
+}
+
+static tm_simulation_entry_i simulation_entry_i = {
+    .id = TM_STATIC_HASH("magnum_free_flight_simulation_entry", 0x376015f09b45c0f2ULL),
+    .display_name = TM_LOCALIZE_LATER("Magnum Free Flight"),
+    .start = start,
+    .stop = stop,
+    .tick = tick,
+};
+
 TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
 {
     tm_global_api_registry = reg;
@@ -894,8 +1342,13 @@ TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
     tm_the_truth_common_types_api = tm_get_api(reg, tm_the_truth_common_types_api);
     tm_logger_api = tm_get_api(reg, tm_logger_api);
     tm_visibility_flags_api = tm_get_api(reg, tm_visibility_flags_api);
+    tm_simulation_api = tm_get_api(reg, tm_simulation_api);
+    tm_ui_api = tm_get_api(reg, tm_ui_api);
+    tm_camera_api = tm_get_api(reg, tm_camera_api);
 
     mag_voxel_api = tm_get_api(reg, mag_voxel_api);
+
+    tm_add_or_remove_implementation(reg, load, tm_simulation_entry_i, &simulation_entry_i);
 
     tm_add_or_remove_implementation(reg, load, tm_unit_test_i, mag_terrain_component_tests);
     tm_add_or_remove_implementation(reg, load, tm_entity_register_engines_simulation_i, entity_simulation__register);
