@@ -1,0 +1,6 @@
+__type: "tm_plugin"
+__uuid: "aa3d66fe-6c91-8e85-1616-d9f3a37214a5"
+import_on_change: true
+windows_dll_import_path: "C:\\Users\\endra\\Work\\magnum\\plugins\\bin\\Debug\\mag_free_flight_simulation.dll"
+windows_dll: "25d6b37120c5314e"
+__asset_uuid: "96fa299b-4849-3e91-8f5c-21a0a7868e19"

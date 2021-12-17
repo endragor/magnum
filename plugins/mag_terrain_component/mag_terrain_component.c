@@ -15,10 +15,6 @@ static struct tm_the_truth_common_types_api *tm_the_truth_common_types_api;
 static struct tm_logger_api *tm_logger_api;
 static struct tm_visibility_flags_api *tm_visibility_flags_api;
 static struct tm_entity_commands_api *tm_entity_commands_api;
-static struct tm_simulation_api *tm_simulation_api;
-static struct tm_input_api *tm_input_api;
-static struct tm_camera_api *tm_camera_api;
-static struct tm_ui_api *tm_ui_api;
 
 static struct mag_voxel_api *mag_voxel_api;
 
@@ -34,9 +30,9 @@ static struct mag_voxel_api *mag_voxel_api;
 #include <foundation/input.h>
 #include <foundation/localizer.h>
 #include <foundation/log.h>
+#include <foundation/math.inl>
 #include <foundation/murmurhash64a.inl>
 #include <foundation/profiler.h>
-#include <foundation/rect.inl>
 #include <foundation/the_truth.h>
 #include <foundation/the_truth_types.h>
 #include <foundation/unit_test.h>
@@ -53,16 +49,12 @@ static struct mag_voxel_api *mag_voxel_api;
 #include <plugins/renderer/renderer.h>
 #include <plugins/renderer/resources.h>
 #include <plugins/shader_system/shader_system.h>
-#include <plugins/simulation/simulation.h>
-#include <plugins/simulation/simulation_entry.h>
 #include <plugins/the_machinery_shared/component_interfaces/editor_ui_interface.h>
 #include <plugins/the_machinery_shared/component_interfaces/render_interface.h>
 #include <plugins/the_machinery_shared/frustum_culling.h>
 #include <plugins/the_machinery_shared/render_context.h>
-#include <plugins/ui/ui.h>
-#include <plugins/ui/ui_custom.h>
 
-#include <foundation/math.inl>
+#include "plugins/mag_voxel/mag_voxel.h"
 
 enum {
     TM_VERTEX_SEMANTIC_POSITION = 0,
@@ -79,17 +71,6 @@ enum {
     TM_VERTEX_SEMANTIC_MAX_SEMANTICS,
     TM_INDEX_SEMANTIC = 16
 };
-
-#include "plugins/mag_voxel/mag_voxel.h"
-
-typedef enum op_type_t {
-    OP_UNION,
-    OP_SUBTRACT,
-} op_type_t;
-
-typedef enum op_primitive_t {
-    OP_SPHERE,
-} op_primitive_t;
 
 typedef struct op_t
 {
@@ -273,7 +254,7 @@ static mag_terrain_component_t default_values = {
     .color_rgb = { 0.8f, 0.8f, 0.8f },
 };
 
-typedef struct mag_terrain_component_manager_t
+typedef struct mag_terrain_component_manager_o
 {
     tm_entity_context_o *ctx;
     tm_allocator_i allocator;
@@ -289,7 +270,7 @@ typedef struct mag_terrain_component_manager_t
     /* carray */ op_t *ops;
     uint64_t applied_op_count;
 
-} mag_terrain_component_manager_t;
+} mag_terrain_component_manager_o;
 
 static float properties_ui(struct tm_properties_ui_args_t *args, tm_rect_t item_rect, tm_tt_id_t object);
 
@@ -446,7 +427,7 @@ static void generate_mesh(tm_renderer_backend_i *rb, tm_shader_repository_o *sha
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
 
-static void apply_op(mag_terrain_component_manager_t *man, const op_t *op, tm_engine_update_set_t *data)
+static void apply_op(mag_terrain_component_manager_o *man, const op_t *op, tm_engine_update_set_t *data)
 {
     TM_INIT_TEMP_ALLOCATOR(ta);
 
@@ -491,7 +472,7 @@ static void add(tm_component_manager_o *manager, struct tm_entity_commands_o *co
     c->visibility_mask = tm_visibility_flags_api->build_visibility_mask(context, 0, 0);
 }
 
-static void destroy_mesh(mag_terrain_component_t *c, mag_terrain_component_manager_t *man)
+static void destroy_mesh(mag_terrain_component_t *c, mag_terrain_component_manager_o *man)
 {
     if (c->mesh.vbuf.resource) {
         tm_renderer_resource_command_buffer_o *res_buf;
@@ -519,7 +500,7 @@ static void destroy_mesh(mag_terrain_component_t *c, mag_terrain_component_manag
 static void remove(tm_component_manager_o *manager, struct tm_entity_commands_o *commands, tm_entity_t e, void *data)
 {
     mag_terrain_component_t *c = data;
-    mag_terrain_component_manager_t *man = (mag_terrain_component_manager_t *)manager;
+    mag_terrain_component_manager_o *man = (mag_terrain_component_manager_o *)manager;
 
     tm_shader_system_o *vertex_buffer_system = tm_shader_repository_api->lookup_system(man->shader_repo, tm_murmur_hash_string("vertex_buffer_system"));
     tm_shader_io_o *io = tm_shader_api->system_io(vertex_buffer_system);
@@ -535,7 +516,7 @@ static void remove(tm_component_manager_o *manager, struct tm_entity_commands_o 
 
 static void destroy(tm_component_manager_o *manager)
 {
-    mag_terrain_component_manager_t *man = (mag_terrain_component_manager_t *)manager;
+    mag_terrain_component_manager_o *man = (mag_terrain_component_manager_o *)manager;
 
     const tm_component_type_t terrain_component = tm_entity_api->lookup_component_type(man->ctx, MAG_TT_TYPE_HASH__TERRAIN_COMPONENT);
     tm_entity_api->call_remove_on_all_entities(man->ctx, terrain_component);
@@ -559,8 +540,8 @@ static void create_mag_terrain_component(tm_entity_context_o *ctx)
 
     tm_allocator_i a;
     tm_entity_api->create_child_allocator(ctx, MAG_TT_TYPE__TERRAIN_COMPONENT, &a);
-    mag_terrain_component_manager_t *manager = tm_alloc(&a, sizeof(*manager));
-    *manager = (mag_terrain_component_manager_t) {
+    mag_terrain_component_manager_o *manager = tm_alloc(&a, sizeof(*manager));
+    *manager = (mag_terrain_component_manager_o) {
         .ctx = ctx,
         .allocator = a,
         .backend = backend,
@@ -710,7 +691,7 @@ static void generate_region_gpu(tm_renderer_backend_i *rb, tm_shader_repository_
     // TODO: destroy/shrink unneeded buffers
 }
 
-static void dual_contour_cpu(mag_terrain_component_t *c, mag_terrain_component_manager_t *man, tm_shader_io_o *io, tm_renderer_backend_i *rb)
+static void dual_contour_cpu(mag_terrain_component_t *c, mag_terrain_component_manager_o *man, tm_shader_io_o *io, tm_renderer_backend_i *rb)
 {
     mag_voxel_region_t region;
 
@@ -752,7 +733,7 @@ static void dual_contour_cpu(mag_terrain_component_t *c, mag_terrain_component_m
     rb->destroy_resource_command_buffers(rb->inst, &res_buf, 1);
 }
 
-static void recreate_mesh(mag_terrain_component_t *c, mag_terrain_component_manager_t *man)
+static void recreate_mesh(mag_terrain_component_t *c, mag_terrain_component_manager_o *man)
 {
     TM_PROFILER_BEGIN_FUNC_SCOPE();
 
@@ -799,7 +780,7 @@ static void render(struct tm_component_manager_o *manager, struct tm_render_args
     uint32_t num_viewers, const tm_entity_t *entities, const tm_transform_component_t *entity_transforms, const bool *entity_selection_state, const uint32_t *entity_indices,
     void **render_component_data, uint32_t num_renderables, const uint8_t *frustum_visibility)
 {
-    mag_terrain_component_manager_t *man = (mag_terrain_component_manager_t *)manager;
+    mag_terrain_component_manager_o *man = (mag_terrain_component_manager_o *)manager;
     TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
 
     tm_shader_o *shader = tm_shader_repository_api->lookup_shader(args->shader_repository, tm_murmur_hash_string("magnum_terrain"));
@@ -952,7 +933,7 @@ static tm_unit_test_i *mag_terrain_component_tests = &(tm_unit_test_i) {
 
 void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *data, struct tm_entity_commands_o *commands)
 {
-    mag_terrain_component_manager_t *man = (mag_terrain_component_manager_t *)inst;
+    mag_terrain_component_manager_o *man = (mag_terrain_component_manager_o *)inst;
 
     TM_INIT_TEMP_ALLOCATOR(ta);
 
@@ -1099,7 +1080,7 @@ static bool aabb_segment_intersect(const aabb_t *aabb, tm_vec3_t start, tm_vec3_
     }
 }
 
-static bool cast_ray(mag_terrain_component_manager_t *man, tm_vec3_t ray_start, tm_vec3_t ray_dir, float max_distance, float *hit_distance)
+static bool cast_ray(mag_terrain_component_manager_o *man, tm_vec3_t ray_start, tm_vec3_t ray_dir, float max_distance, float *hit_distance)
 {
     TM_ASSERT(max_distance < (float)MAG_VOXEL_CHUNK_SIZE, tm_error_api->def, "max ray distance (%f) beyond region size (%f) is not supported", max_distance, (float)MAG_VOXEL_CHUNK_SIZE);
     tm_vec3_t chunk_size = { (float)MAG_VOXEL_CHUNK_SIZE, (float)MAG_VOXEL_CHUNK_SIZE, (float)MAG_VOXEL_CHUNK_SIZE };
@@ -1206,6 +1187,22 @@ check_count:
     return *hit_distance != -9999.f;
 }
 
+void apply_operation(mag_terrain_component_manager_o *man, mag_terrain_op_type_t type, mag_terrain_op_primitive_t primitive, tm_vec3_t pos, tm_vec3_t size)
+{
+    op_t op = {
+        .type = type,
+        .primitive = primitive,
+        .pos = pos,
+        .size = size,
+    };
+    tm_carray_push(man->ops, op, &man->allocator);
+}
+
+static struct mag_terrain_api terrain_api = {
+    .cast_ray = cast_ray,
+    .apply_operation = apply_operation,
+};
+
 static void entity_simulation__register(struct tm_entity_context_o *ctx)
 {
     if (tm_entity_api->get_blackboard_double(ctx, TM_ENTITY_BB__EDITOR, 0))
@@ -1218,7 +1215,7 @@ static void entity_simulation__register(struct tm_entity_context_o *ctx)
         return;
 
     // TOOD: move to components_created
-    mag_terrain_component_manager_t *man = (mag_terrain_component_manager_t *)tm_entity_api->component_manager(ctx, mag_terrain_component);
+    mag_terrain_component_manager_o *man = (mag_terrain_component_manager_o *)tm_entity_api->component_manager(ctx, mag_terrain_component);
     man->component_mask = tm_entity_api->create_component_mask((tm_component_type_t[2]) { transform_component, mag_terrain_component }, 2);
 
     const tm_engine_i mirror_sound_sources = {
@@ -1232,95 +1229,9 @@ static void entity_simulation__register(struct tm_entity_context_o *ctx)
         .before_me = { TM_PHASE__CAMERA },
         .after_me = { TM_PHASE__RENDER },
     };
+
     tm_entity_api->register_engine(ctx, &mirror_sound_sources);
 }
-
-#define MAX_OPS_PER_SECOND 5
-#define MAX_SCULPT_DISTANCE 31.0
-
-typedef struct tm_simulation_state_o
-{
-    tm_allocator_i *allocator;
-    tm_simulation_o *simulation_ctx;
-    tm_entity_context_o *entity_ctx;
-
-    mag_terrain_component_manager_t *terrain_mgr;
-
-    double last_op_time;
-} tm_simulation_state_o;
-
-static void private__cursor_line(const tm_camera_t *camera, tm_vec2_t mouse_pos, tm_rect_t viewport_r, tm_vec3_t *cursor_pos, tm_vec3_t *cursor_dir)
-{
-    const tm_vec3_t cursor[2] = { { mouse_pos.x, mouse_pos.y, 0 }, { mouse_pos.x, mouse_pos.y, 1 } };
-    tm_vec3_t cursor_world[2];
-    tm_camera_api->screen_to_world(camera, TM_CAMERA_TRANSFORM_DEFAULT, viewport_r, cursor, cursor_world, 2);
-    *cursor_pos = cursor_world[0];
-    *cursor_dir = tm_vec3_normalize(tm_vec3_sub(cursor_world[1], cursor_world[0]));
-}
-
-static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
-{
-    if (!args->ui || args->time - state->last_op_time < 1.0 / MAX_OPS_PER_SECOND)
-        return;
-
-    tm_ui_buffers_t uib = tm_ui_api->buffers(args->ui);
-    if (!uib.input->left_mouse_is_down)
-        return;
-
-    if (!tm_vec2_in_rect(uib.input->mouse_pos, args->rect))
-        return;
-
-    // tm_vec2_t cursor_screen_pos = { uib.input->mouse_pos.x - args->rect.x, uib.input->mouse_pos.y - args->rect.y };
-    const tm_camera_t *camera = tm_entity_api->get_blackboard_ptr(state->entity_ctx, TM_ENTITY_BB__CAMERA);
-    if (!camera)
-        return;
-
-    tm_vec3_t cursor_pos;
-    tm_vec3_t cursor_dir;
-    private__cursor_line(camera, uib.input->mouse_pos, args->rect, &cursor_pos, &cursor_dir);
-
-    float hit_length;
-    if (cast_ray(state->terrain_mgr, cursor_pos, cursor_dir, MAX_SCULPT_DISTANCE, &hit_length)) {
-        state->last_op_time = args->time;
-        op_t op = {
-            .pos = tm_vec3_add(cursor_pos, tm_vec3_mul(cursor_dir, hit_length)),
-            .size = { 2.f, 1.f, 1.f },
-            .primitive = OP_SPHERE,
-            .type = OP_UNION,
-        };
-        tm_carray_push(state->terrain_mgr->ops, op, &state->terrain_mgr->allocator);
-    }
-}
-
-static tm_simulation_state_o *start(tm_simulation_start_args_t *args)
-{
-    tm_simulation_state_o *state = tm_alloc(args->allocator, sizeof(*state));
-    *state = (tm_simulation_state_o) {
-        .allocator = args->allocator,
-        .entity_ctx = args->entity_ctx,
-        .simulation_ctx = args->simulation_ctx,
-        .last_op_time = -1.0 / MAX_OPS_PER_SECOND,
-    };
-
-    tm_component_type_t terrain_component = tm_entity_api->lookup_component_type(state->entity_ctx, MAG_TT_TYPE_HASH__TERRAIN_COMPONENT);
-    state->terrain_mgr = (mag_terrain_component_manager_t *)tm_entity_api->component_manager(state->entity_ctx, terrain_component);
-
-    return state;
-}
-
-static void stop(tm_simulation_state_o *state, struct tm_entity_commands_o *commands)
-{
-    tm_allocator_i a = *state->allocator;
-    tm_free(&a, state, sizeof(*state));
-}
-
-static tm_simulation_entry_i simulation_entry_i = {
-    .id = TM_STATIC_HASH("magnum_free_flight_simulation_entry", 0x376015f09b45c0f2ULL),
-    .display_name = TM_LOCALIZE_LATER("Magnum Free Flight"),
-    .start = start,
-    .stop = stop,
-    .tick = tick,
-};
 
 TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
 {
@@ -1342,13 +1253,10 @@ TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
     tm_the_truth_common_types_api = tm_get_api(reg, tm_the_truth_common_types_api);
     tm_logger_api = tm_get_api(reg, tm_logger_api);
     tm_visibility_flags_api = tm_get_api(reg, tm_visibility_flags_api);
-    tm_simulation_api = tm_get_api(reg, tm_simulation_api);
-    tm_ui_api = tm_get_api(reg, tm_ui_api);
-    tm_camera_api = tm_get_api(reg, tm_camera_api);
 
     mag_voxel_api = tm_get_api(reg, mag_voxel_api);
 
-    tm_add_or_remove_implementation(reg, load, tm_simulation_entry_i, &simulation_entry_i);
+    tm_set_or_remove_api(reg, load, mag_terrain_api, &terrain_api);
 
     tm_add_or_remove_implementation(reg, load, tm_unit_test_i, mag_terrain_component_tests);
     tm_add_or_remove_implementation(reg, load, tm_entity_register_engines_simulation_i, entity_simulation__register);

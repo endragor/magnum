@@ -1,6 +1,6 @@
 __type: "tm_plugin"
 __uuid: "700c7231-8deb-5e57-6866-b49dd563a41b"
 import_on_change: true
-windows_dll_import_path: "..\\..\\plugins\\bin\\Debug\\mag_terrain_component.dll"
-windows_dll: "f371a2f1c81696ad"
+windows_dll_import_path: "C:\\Users\\endra\\Work\\magnum\\plugins\\bin\\Debug\\mag_terrain_component.dll"
+windows_dll: "17d2dd1019c55782"
 __asset_uuid: "5e74df0a-0a0c-0904-9e29-1f11f9b09a9e"

@@ -201,3 +201,11 @@ project "mag_terrain_component"
     language "C++"
     sysincludedirs {".."}
     files {"mag_terrain_component/*.inl", "mag_terrain_component/*.h", "mag_terrain_component/*.c"}
+
+project "mag_free_flight_simulation"
+    location "build/mag_free_flight_simulation"
+    targetname "mag_free_flight_simulation"
+    kind "SharedLib"
+    language "C++"
+    sysincludedirs {".."}
+    files {"mag_free_flight_simulation/*.inl", "mag_free_flight_simulation/*.h", "mag_free_flight_simulation/*.c"}
