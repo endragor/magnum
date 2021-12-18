@@ -1,0 +1,6 @@
+__type: "tm_plugin"
+__uuid: "ca85faa0-1626-fda8-f2e3-06fe3d8a8013"
+import_on_change: true
+windows_dll_import_path: "C:\\Users\\endra\\Work\\magnum\\plugins\\bin\\Debug\\mag_async_gpu_queue.dll"
+windows_dll: "3410172126ae59a0"
+__asset_uuid: "7abf13be-a065-5c59-b66e-9e421d4593c9"
