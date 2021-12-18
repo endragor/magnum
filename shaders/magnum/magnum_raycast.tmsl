@@ -1,0 +1,67 @@
+imports: [
+    { name: "region_densities" type: "buffer" elements: 4 }
+    { name: "region_positions" type: "float3" elements: 4 }
+    { name: "region_count" type: "uint" }
+
+    { name: "ray_start" type: "float3" }
+    { name: "ray_dir" type: "float3" }
+    { name: "ray_max_length" type: "float" }
+
+    { name: "ray_hit" type: "buffer" uav: true }
+]
+
+compute_shader: {
+    import_system_semantics: [ "dispatch_thread_id" ]
+
+    attributes: {
+        num_threads: [1, 1, 1]
+    }
+
+    code: [[
+        float3 ro = load_ray_start();
+        float3 rd = load_ray_dir();
+        float max_length = load_ray_max_length();
+        float3 region_size = float3(REGION_SIZE, REGION_SIZE, REGION_SIZE);
+        float3 margin = float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN);
+
+        float cur_length = 0;
+        uint region_count = load_region_count();
+        for (uint iter = 0; iter < 256; ++iter) {
+            bool had_inside = false;
+            float3 cur = ro + cur_length * rd;
+            for (uint i = 0; i < region_count; ++i) {
+                float3 inner_point = cur - (load_region_positions(i) - margin);
+                bool3 is_inside = inner_point >= 0 && inner_point < region_size;
+                if (is_inside.x && is_inside.y && is_inside.z) {
+                    had_inside = true;
+                    float3 cellf = floor(inner_point);
+                    uint3 cell = (uint3) cellf;
+
+                    float v[2][2][2];
+                    load_cell_densities(get_region_densities(i), cell, v);
+                    float density = trilerp(v, inner_point - cellf);
+                    if (density < 0.001) {
+                        get_ray_hit().Store(0, cur_length);
+                        return;
+                    }
+                    cur_length += density * 0.95;
+                    if (cur_length > max_length) {
+                        get_ray_hit().Store(0, asuint(-9999.0));
+                        return;
+                    }
+                    break;
+                }
+            }
+            if (!had_inside) {
+                get_ray_hit().Store(0, asuint(-9999.0));
+                return;
+            }
+        }
+
+        get_ray_hit().Store(0, asuint(-9999.0));
+    ]]
+}
+
+compile: {
+    includes: ["magnum_common"]
+}

@@ -2,9 +2,6 @@ common: [[
     #define REGION_SIZE 36
     #define REGION_MARGIN 2
 
-    #define DENSITY_FUNC(p) sdBox(p, float3(5, 5, 5))
-    //#define DENSITY_FUNC(p) sdSphere(p, 5)
-
     float sdBox(float3 p, float3 b) {
         const float3 q = abs(p) - b;
         return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
@@ -14,32 +11,127 @@ common: [[
         return length(p) - r;
     }
 
+    float hash1( float2 p )
+    {
+        p  = 50.0*frac( p*0.3183099 );
+        return frac( p.x*p.y*(p.x+p.y) );
+    }
+
+    float hash1( float n )
+    {
+        return frac( n*17.0*frac( n*0.3183099 ) );
+    }
+
+    float2 hash2( float2 p )
+    {
+        const float2 k = float2( 0.3183099, 0.3678794 );
+        float n = 111.0*p.x + 113.0*p.y;
+        return frac(n*frac(k*n));
+    }
+
+    float noise( in float3 x )
+    {
+        float3 p = floor(x);
+        float3 w = frac(x);
+
+        #if 1
+        float3 u = w*w*w*(w*(w*6.0-15.0)+10.0);
+        #else
+        float3 u = w*w*(3.0-2.0*w);
+        #endif
+
+        float n = p.x + 317.0*p.y + 157.0*p.z;
+
+        float a = hash1(n+0.0);
+        float b = hash1(n+1.0);
+        float c = hash1(n+317.0);
+        float d = hash1(n+318.0);
+        float e = hash1(n+157.0);
+        float f = hash1(n+158.0);
+        float g = hash1(n+474.0);
+        float h = hash1(n+475.0);
+
+        float k0 =   a;
+        float k1 =   b - a;
+        float k2 =   c - a;
+        float k3 =   e - a;
+        float k4 =   a - b - c + d;
+        float k5 =   a - c - e + g;
+        float k6 =   a - b - e + f;
+        float k7 = - a + b + c - d + e - f - g + h;
+
+        return -1.0+2.0*(k0 + k1*u.x + k2*u.y + k3*u.z + k4*u.x*u.y + k5*u.y*u.z + k6*u.z*u.x + k7*u.x*u.y*u.z);
+    }
+
+    #define NUM_OCTAVES 4
+
+    float fbm(float3 p, float a, float f) {
+        float G = 0.5;
+        float t = 0.0;
+
+        float muls[9] = {
+            2.01,
+            1.99,
+            1.97,
+            2.03,
+            2.04,
+            1.97,
+            1.97,
+            1.97,
+            1.97,
+        };
+
+        for(uint i = 0; i < NUM_OCTAVES; i++)
+        {
+            t += a * noise(f * p);
+            f *= muls[i];
+            a *= G;
+        }
+        return t;
+    }
+
+    float density(float3 p) {
+        return p.y + fbm(p / 500.0, 50.0, 2.0);
+        //return p.y + (50.0 + 50.0 * cnoise(p / 100.0));
+    }
+
     float3 calcNormal(float3 p) {
-        const float h = 0.00001; // replace by an appropriate value
-        const float2 k = float2(1, -1);
-        return normalize( k.xyy*DENSITY_FUNC( p + k.xyy*h ) +
-                          k.yyx*DENSITY_FUNC( p + k.yyx*h ) +
-                          k.yxy*DENSITY_FUNC( p + k.yxy*h ) +
-                          k.xxx*DENSITY_FUNC( p + k.xxx*h ) );
+        float2 e = float2(1.0,-1.0)*0.5773*0.0005;
+        return normalize( e.xyy*density( p + e.xyy) +
+					  e.yyx*density( p + e.yyx) +
+					  e.yxy*density( p + e.yxy) +
+					  e.xxx*density( p + e.xxx) );
     }
 
     // xyz - normal, w - density
     float4 magnum_density(float3 pos) {
         float4 ret;
-        float3 center = float3(10, 10, 10);
-        float radius = 5;
+        //float3 center = float3(30, 30, 30);
+        //float radius = 5;
 
-        float3 diff = pos - center;
-        float diff_len = length(diff);
-        ret.w = diff_len - radius;
-        ret.xyz = diff / diff_len;
+        //float3 diff = pos - center;
+        //float diff_len = length(diff);
+        //ret.w = diff_len - radius;
+        //ret.xyz = diff / diff_len;
 
         //ret.w = pos.y - 5;
         //ret.xyz = float3(0, 1, 0);
 
         //ret = sdBox(pos - center, float3(5, 5, 5));
-        //ret.w = DENSITY_FUNC(pos - center);
-        //ret.xyz = calcNormal(pos - center);
+
+        ret.w = density(pos);
+        ret.xyz = calcNormal(pos);
+
+        return ret;
+    }
+
+    float4 sphere_density(float3 p, float3 c, float r) {
+        float4 ret;
+
+        float3 diff = p - c;
+        float diff_len = length(diff);
+        ret.w = diff_len - r;
+        ret.xyz = normalize(diff);// / diff_len;
 
         return ret;
     }
@@ -47,4 +139,58 @@ common: [[
     uint flat_offset(uint x, uint y, uint z) {
         return x * REGION_SIZE * REGION_SIZE + y * REGION_SIZE + z;
     }
+
+    float3 trilerp(float3 corners[2][2][2], float3 c) {
+        // Trilinear interpolation
+        float3 fx1 = lerp(corners[0][0][0], corners[1][0][0], c.x);
+        float3 fx2 = lerp(corners[0][0][1], corners[1][0][1], c.x);
+        float3 fx3 = lerp(corners[0][1][0], corners[1][1][0], c.x);
+        float3 fx4 = lerp(corners[0][1][1], corners[1][1][1], c.x);
+
+        float3 fy1 = lerp(fx1, fx3, c.y);
+        float3 fy2 = lerp(fx2, fx4, c.y);
+
+        return lerp(fy1, fy2, c.z);
+    }
+
+    float trilerp(float corners[2][2][2], float3 c) {
+        // Trilinear interpolation
+        float fx1 = lerp(corners[0][0][0], corners[1][0][0], c.x);
+        float fx2 = lerp(corners[0][0][1], corners[1][0][1], c.x);
+        float fx3 = lerp(corners[0][1][0], corners[1][1][0], c.x);
+        float fx4 = lerp(corners[0][1][1], corners[1][1][1], c.x);
+
+        float fy1 = lerp(fx1, fx3, c.y);
+        float fy2 = lerp(fx2, fx4, c.y);
+
+        return lerp(fy1, fy2, c.z);
+    }
+
+    float2 load2at1(ByteAddressBuffer b, uint3 offset) {
+        return asfloat(b.Load2(flat_offset(offset.x, offset.y, offset.z) * 4));
+    }
+
+    void load_cell_densities(ByteAddressBuffer densities, uint3 cell, out float v[2][2][2]) {
+        float2 v00 = load2at1(densities, cell + uint3(0, 0, 0));
+        float2 v01 = load2at1(densities, cell + uint3(0, 1, 0));
+        float2 v10 = load2at1(densities, cell + uint3(1, 0, 0));
+        float2 v11 = load2at1(densities, cell + uint3(1, 1, 0));
+
+        const float dens[2][2][2] = {
+            v00.x,
+            v00.y,
+            v01.x,
+            v01.y,
+            v10.x,
+            v10.y,
+            v11.x,
+            v11.y,
+        };
+
+        v = dens;
+    }
 ]]
+
+compile: {
+    includes: ["noises"]
+}

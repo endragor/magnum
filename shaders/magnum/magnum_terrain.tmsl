@@ -23,6 +23,7 @@ vertex_shader: {
         { name: "color" type: "float4" }
         { name: "wn" type: "float3" }
         { name: "last_position" type: "float3" }
+        { name: "wp" type: "float3" }
     ]
 
     code: [[
@@ -42,6 +43,7 @@ vertex_shader: {
         output.position = cp;
 
         output.color = float4(load_color(), 1);
+        output.wp = wp.xyz;
 
         #if defined(GBUFFER)
             float4 last_lp = lp;
@@ -78,13 +80,15 @@ pixel_shader: {
             float opacity = 1.0f;
 
             float3 normal = normalize(input.wn);
+            //normal = magnum_density(input.wp).xyz;
 
             const float3 dielectric_specular_f0 = float3(0.04, 0.04, 0.04);
             float metallic = 0.f;
-            float roughness = 0.5f;
+            float roughness = 1.0f;
             float ao = 1.f;
 
             float4 base = input.color;
+            //base.rgb = abs(magnum_density(input.wp).w);
             float3 spec_f0 = lerp(dielectric_specular_f0, base.rgb, metallic);
             base.rgb = lerp(base.rgb * (1 - dielectric_specular_f0), float3(0,0,0), metallic);
 

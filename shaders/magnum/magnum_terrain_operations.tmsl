@@ -1,0 +1,54 @@
+imports: [
+    { name: "region_pos" type: "float3" }
+    { name: "cell_size" type: "float" }
+
+    { name: "densities" type: "buffer" uav:true }
+    { name: "normals" type: "buffer" uav:true }
+
+    // 0 - union
+    { name: "operation" type: "uint" }
+    // 0 - sphere
+    { name: "primitive_type" type: "uint" }
+    { name: "primitive_position" type: "float3" }
+    { name: "primitive_size" type: "float3" }
+]
+
+common: [[
+]]
+
+
+compute_shader: {
+    import_system_semantics: [ "dispatch_thread_id" ]
+
+    attributes: {
+        num_threads: [36, 1, 1]
+    }
+
+    code: [[
+        float3 margin = float3(REGION_MARGIN, 0, 0);
+        float3 region_pos = load_region_pos();
+        float cell_size = load_cell_size();
+
+        //uint op = load_operation();
+        //uint primitive = load_primitive();
+
+        RWByteAddressBuffer densities = get_densities();
+        RWByteAddressBuffer normals = get_normals();
+        uint corner_idx = flat_offset(dispatch_thread_id.x, dispatch_thread_id.y, dispatch_thread_id.z);
+
+        float cur_density = asfloat(densities.Load(corner_idx * 4));
+
+        float3 pos = region_pos + ((float3)dispatch_thread_id - margin.xxx) * cell_size;
+        float4 primitive_density;
+        primitive_density = sphere_density(pos, load_primitive_position(), load_primitive_size().x);
+
+        if ((primitive_density.w) < (cur_density)) {
+            densities.Store(corner_idx * 4, asuint(primitive_density.w));
+            normals.Store3(corner_idx * 12, asuint(primitive_density.xyz));
+        }
+    ]]
+}
+
+compile: {
+    includes: ["magnum_common"]
+}

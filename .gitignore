@@ -3,3 +3,4 @@
 /plugins/build
 /plugins/bin
 /plugins/lib
+/shaders/*.inl
