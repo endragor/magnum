@@ -5,8 +5,8 @@
             "name": "Win64: the-machinery",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${env:TM_SDK_DIR}/bin/the-machinery.exe",
-            "symbolSearchPath": "${workspaceFolder}\\plugins\\bin\\Debug",
+            "program": "${env:TM_SDK_DIR}/bin/Debug/the-machinery.exe",
+            "symbolSearchPath": "${workspaceFolder}\\plugins\\bin\\Debug;${env:TM_SOURCE_DIR}\\bin\\Debug;${env:TM_SOURCE_DIR}\\bin\\Debug\\plugins",
             "symbolLoadInfo": {
                 "loadAll": true,
             },
@@ -15,6 +15,8 @@
                 "false",
                 "--load-project",
                 "${workspaceFolder}/project/project.the_machinery_dir",
+                "--shader-dir",
+                "${workspaceFolder}/shaders",
             ],
             "logging":{
                 "moduleLoad": true,
@@ -39,7 +41,7 @@
             },
             "args": [
                 "-p",
-                "${workspaceFolder}\\plugins\\bin\\Debug\\mag_voxel.dll",
+                "${workspaceFolder}\\plugins\\bin\\Debug\\mag_terrain_component.dll",
             ],
             "logging":{
                 "moduleLoad": true,

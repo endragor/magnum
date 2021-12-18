@@ -10,6 +10,7 @@
                 "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/shared",
                 "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/winrt",
                 "${workspaceRoot}",
+                "${TM_SDK_DIR}",
                 "${TM_SDK_DIR}/headers"
             ],
             "defines": [
@@ -27,6 +28,7 @@
                     "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/shared",
                     "C:/Program Files (x86)/Windows Kits/10/Include/10.0.18362.0/winrt",
                     "${TM_SDK_DIR}/headers",
+                    "${TM_SDK_DIR}",
                     "${workspaceRoot}"
                 ],
                 "limitSymbolsToIncludedHeaders": true,
@@ -40,6 +42,7 @@
             "includePath": [
                 "/usr/include",
                 "/usr/local/include",
+                "${TM_SDK_DIR}",
                 "${TM_SDK_DIR}/headers"
             ],
             "defines": [
