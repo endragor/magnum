@@ -2,6 +2,7 @@ static struct tm_entity_api *tm_entity_api;
 static struct tm_simulation_api *tm_simulation_api;
 static struct tm_camera_api *tm_camera_api;
 static struct tm_ui_api *tm_ui_api;
+static struct tm_tag_component_api *tm_tag_component_api;
 
 static struct mag_terrain_api *mag_terrain_api;
 
@@ -13,6 +14,7 @@ static struct mag_terrain_api *mag_terrain_api;
 #include <foundation/rect.inl>
 
 #include <plugins/entity/entity.h>
+#include <plugins/entity/tag_component.h>
 #include <plugins/simulation/simulation.h>
 #include <plugins/simulation/simulation_entry.h>
 #include <plugins/ui/ui.h>
@@ -80,6 +82,11 @@ static tm_simulation_state_o *start(tm_simulation_start_args_t *args)
         .simulation_ctx = args->simulation_ctx,
         .last_op_time = -1.0 / MAX_OPS_PER_SECOND,
     };
+    tm_component_type_t tag_component = tm_entity_api->lookup_component_type(state->entity_ctx, TM_TT_TYPE_HASH__TAG_COMPONENT);
+    tm_tag_component_manager_o *tag_mgr = (tm_tag_component_manager_o *)tm_entity_api->component_manager(state->entity_ctx, tag_component);
+    const tm_entity_t camera = tm_tag_component_api->find_first(tag_mgr, TM_STATIC_HASH("camera", 0x60ed8c3931822dc7ULL));
+    if (camera.u64)
+        tm_simulation_api->set_camera(state->simulation_ctx, camera);
 
     tm_component_type_t terrain_component = tm_entity_api->lookup_component_type(state->entity_ctx, MAG_TT_TYPE_HASH__TERRAIN_COMPONENT);
     state->terrain_mgr = (mag_terrain_component_manager_o *)tm_entity_api->component_manager(state->entity_ctx, terrain_component);
@@ -108,6 +115,7 @@ TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
     tm_simulation_api = tm_get_api(reg, tm_simulation_api);
     tm_ui_api = tm_get_api(reg, tm_ui_api);
     tm_camera_api = tm_get_api(reg, tm_camera_api);
+    tm_tag_component_api = tm_get_api(reg, tm_tag_component_api);
 
     mag_terrain_api = tm_get_api(reg, mag_terrain_api);
 
