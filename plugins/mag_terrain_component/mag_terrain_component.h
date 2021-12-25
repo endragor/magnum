@@ -5,9 +5,27 @@
 #define MAG_TT_TYPE__TERRAIN_COMPONENT "mag_terrain_component"
 #define MAG_TT_TYPE_HASH__TERRAIN_COMPONENT TM_STATIC_HASH("mag_terrain_component", 0xa6988af44e888d7bULL)
 
+#define MAG_TT_TYPE__TERRAIN_SETTINGS "mag_terrain_settings"
+#define MAG_TT_TYPE_HASH__TERRAIN_SETTINGS TM_STATIC_HASH("mag_terrain_settings", 0xd211ef5b239a0f0fULL)
+
+#define MAG_TT_TYPE__TERRAIN_MATERIAL "mag_terrain_material"
+#define MAG_TT_TYPE_HASH__TERRAIN_MATERIAL TM_STATIC_HASH("mag_terrain_material", 0x1773fda193a888aULL)
+
 enum {
     MAG_TT_PROP__TERRAIN_COMPONENT__VISIBILITY_FLAGS, //suboject_set
     MAG_TT_PROP__TERRAIN_COMPONENT__COLOR, // subobject [[TM_TT_TYPE__COLOR_RGB]]
+    MAG_TT_PROP__TERRAIN_COMPONENT__SETTINGS, // subobject [[MAG_TT_TYPE__TERRAIN_SETTINGS]]
+};
+
+enum {
+    MAG_TT_PROP__TERRAIN_SETTINGS__MATERIALS, // subobject_set [[MAG_TT_TYPE__TERRAIN_MATERIAL]]
+};
+
+enum {
+    MAG_TT_PROP__TERRAIN_MATERIAL__ORDER, // double
+    MAG_TT_PROP__TERRAIN_MATERIAL__TEXTURES, // reference [[TM_TT_TYPE__CREATION_GRAPH]]
+    MAG_TT_PROP__TERRAIN_MATERIAL__ALLOW_FROM_TOP, // bool
+    MAG_TT_PROP__TERRAIN_MATERIAL__ALLOW_FROM_SIDES, // bool
 };
 
 // Manager for terrain engine. Get it using [[tm_entity_api->component_manager()]].
