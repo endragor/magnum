@@ -2,6 +2,34 @@ depth_stencil_states: {
     depth_test_enable: true
     depth_write_enable: true
     depth_compare_op: "greater_equal"
+
+	stencil_test_enable: false
+	stencil_front_fail_op: "keep"
+	stencil_front_pass_op: "invert"
+	stencil_front_depth_fail_op: "keep"
+	stencil_front_compare_op: "equal"
+	stencil_front_compare_mask: 1
+	stencil_front_compare_write_mask: 1
+	stencil_front_reference: 0
+}
+
+samplers: {
+	default_sampler: {
+		min_filter: "linear"
+		max_filter: "linear"
+		mip_mode: "linear"
+		address_u: "wrap"
+		address_v: "wrap"
+		address_w: "wrap"
+		mip_lod_bias: 0
+		anisotropy_enable: true
+		max_anisotropy: 16
+		compare_enable: false
+		compare_op: "less_equal"
+		min_lod: 0
+		max_lod: 16
+		border_color: "float_opaque_white"
+	}
 }
 
 raster_states: {
@@ -13,8 +41,156 @@ raster_states: {
 imports: [
     { name: "last_tm" type: "float4x4" }
     { name: "tm" type: "float4x4" }
-    { name: "color" type: "float3" }
+    { name: "color" type: "float4" }
+    { name: "region_pos" type: "float3" }
+    { name: "cell_size" type: "float" }
+    { name: "lod_center", type: "float3" }
+    { name: "lod_size", type: "float3" }
+
+    { name: "default_sampler" type: "sampler" sampler: "default_sampler" }
+    { name: "diffuse_map" type: "texture_2d" element_type: "float4" elements: 2 }
+    { name: "normal_map" type: "texture_2d" element_type: "float4" elements: 2}
+    { name: "occlusion_map" type: "texture_2d" element_type: "float4" elements: 2}
+    { name: "roughness_map" type: "texture_2d" element_type: "float4" elements: 2}
 ]
+
+common: [[
+    #define TEXTURE_SCALE 0.001
+
+    float3 blends(float3 wn) {
+        float3 blend = pow(abs(wn), 4);
+        blend /= dot(blend, float3(1,1,1));
+        return blend;
+    }
+
+    float3 triplanar_normal_whiteout(Texture2D<vector<float, 4> > map, Texture2D<vector<float, 4> > map_top, SamplerState sampler, float3 wp, float3 wn, float3 blend) {
+        // Whiteout blend
+        // Triplanar uvs
+        float2 uvX = wp.zy; // x facing plane
+        float2 uvY = wp.xz; // y facing plane
+        float2 uvZ = wp.xy; // z facing plane
+
+        // Tangent space normal maps
+        float3 codedX = normalize(map.Sample(sampler, uvX * TEXTURE_SCALE).xyz);
+        float3 codedY = normalize(map_top.Sample(sampler, uvY * TEXTURE_SCALE).xyz);
+        float3 codedZ = normalize(map.Sample(sampler, uvZ * TEXTURE_SCALE).xyz);
+
+        //codedX.g = 1.0-codedX.g;
+        //codedY.g = 1.0-codedY.g;
+        //codedZ.g = 1.0-codedZ.g;
+
+        float3 tnormalX = (decode_normal_map(codedX.xy));
+        float3 tnormalY = (decode_normal_map(codedY.xy));
+        float3 tnormalZ = (decode_normal_map(codedZ.xy));
+
+        //tnormalX = ((codedX.xyz - 0.5) * 2);
+        //tnormalY = ((codedY.xyz - 0.5) * 2);
+        //tnormalZ = ((codedZ.xyz - 0.5) * 2);
+
+        // Swizzle world normals into tangent space and apply Whiteout blend
+        tnormalX = float3(
+            tnormalX.xy + wn.zy,
+            tnormalX.z * wn.x
+        );
+        tnormalY = float3(
+            tnormalY.xy + wn.xz,
+            tnormalY.z * wn.y
+        );
+        tnormalZ = float3(
+            tnormalZ.xy + wn.xy,
+            tnormalZ.z * wn.z
+        );
+
+        // Swizzle tangent normals to match world orientation and triblend
+        return normalize(
+            tnormalX.zyx * blend.x +
+            tnormalY.xzy * blend.y +
+            tnormalZ.xyz * blend.z
+        );
+    }
+
+    float3 triplanar_normal_gems(Texture2D<vector<float, 4> > map, Texture2D<vector<float, 4> > map_top, SamplerState sampler, float3 wp, float3 wn, float3 blend) {
+        // GPU Gems 3 blend
+        // Triplanar uvs
+        float2 uvX = wp.zy; // x facing plane
+        float2 uvY = wp.xz; // y facing plane
+        float2 uvZ = wp.xy; // z facing plane
+
+        // Tangent space normal maps
+        float2 codedX = map.Sample(sampler, uvX * TEXTURE_SCALE).xy;
+        float2 codedY = map_top.Sample(sampler, uvY * TEXTURE_SCALE).xy;
+        float2 codedZ = map.Sample(sampler, uvZ * TEXTURE_SCALE).xy;
+
+        //codedX.g = 1.0-codedX.g;
+        //codedY.g = 1.0-codedY.g;
+        //codedZ.g = 1.0-codedZ.g;
+
+        //float3 signs = sign(wn);
+
+        float3 tnormalX = decode_normal_map(codedX);
+        float3 tnormalY = decode_normal_map(codedY);
+        float3 tnormalZ = decode_normal_map(codedZ);
+
+        float3 normalX = float3(0.0, tnormalX.yx);
+        float3 normalY = float3(tnormalY.x, 0.0, tnormalY.y);
+        float3 normalZ = float3(tnormalZ.xy, 0.0);
+
+        // Triblend normals and add to world normal
+        return normalize(
+            normalX.xyz * blend.x +
+            normalY.xyz * blend.y +
+            normalZ.xyz * blend.z +
+            wn
+        );
+    }
+
+    float3 triplanar_normal(Texture2D<vector<float, 4> > map, Texture2D<vector<float, 4> > map_top, SamplerState sampler, float3 wp, float3 wn, float3 blend) {
+        // Whiteout blend
+        // Triplanar uvs
+        float2 uvX = wp.zy; // x facing plane
+        float2 uvY = wp.xz; // y facing plane
+        float2 uvZ = wp.xy; // z facing plane
+
+        // Tangent space normal maps
+        float2 codedX = map.Sample(sampler, uvX * TEXTURE_SCALE).xy;
+        float2 codedY = map_top.Sample(sampler, uvY * TEXTURE_SCALE).xy;
+        float2 codedZ = map.Sample(sampler, uvZ * TEXTURE_SCALE).xy;
+
+        //codedX.g = 1.0-codedX.g;
+        //codedY.g = 1.0-codedY.g;
+        //codedZ.g = 1.0-codedZ.g;
+
+        //float3 signs = sign(wn);
+
+        float3 tnormalX = decode_normal_map(codedX);
+        float3 tnormalY = decode_normal_map(codedY);
+        float3 tnormalZ = decode_normal_map(codedZ);
+
+        float3 axisSign = sign(wn);
+        // Flip tangent normal z to account for surface normal facing
+        tnormalX.z *= axisSign.x;
+        tnormalY.z *= axisSign.y;
+        tnormalZ.z *= axisSign.z;
+        // Swizzle tangent normals to match world orientation and triblend
+        return normalize(
+            tnormalX.zyx * blend.x +
+            tnormalY.xzy * blend.y +
+            tnormalZ.xyz * blend.z
+        );
+    }
+
+    float3 triplanar_blend(Texture2D<vector<float, 4> > map, Texture2D<vector<float, 4> > map_top, SamplerState sampler, float3 wp, float3 blend) {
+        float2 uvX = wp.zy;
+        float2 uvY = wp.xz;
+        float2 uvZ = wp.xy;
+
+        float3 x = (map.Sample(sampler, uvX * TEXTURE_SCALE).xyz);
+        float3 y = (map_top.Sample(sampler, uvY * TEXTURE_SCALE).xyz);
+        float3 z = (map.Sample(sampler, uvZ * TEXTURE_SCALE).xyz);
+
+        return float3(x * blend.x + y * blend.y + z * blend.z);
+    }
+]]
 
 vertex_shader: {
     import_system_semantics : [ "vertex_id" ]
@@ -42,7 +218,7 @@ vertex_shader: {
         cp = taa_enabled ? add_taa_offset(cp, load_frame_number(), load_render_target_resolution()) : cp;
         output.position = cp;
 
-        output.color = float4(load_color(), 1);
+        output.color = load_color();
         output.wp = wp.xyz;
 
         #if defined(GBUFFER)
@@ -59,60 +235,84 @@ vertex_shader: {
 
 pixel_shader: {
     code: [[
-        #if defined(GBUFFER) && 0
-            float3 normal = normalize(input.wn);
-            float3 encoded_normal = encode_signed_oct(normal);
+        float4x4 thresholdMatrix =
+        {
+            1.0 / 17.0,  9.0 / 17.0,  3.0 / 17.0, 11.0 / 17.0,
+            13.0 / 17.0,  5.0 / 17.0, 15.0 / 17.0,  7.0 / 17.0,
+            4.0 / 17.0, 12.0 / 17.0,  2.0 / 17.0, 10.0 / 17.0,
+            16.0 / 17.0,  8.0 / 17.0, 14.0 / 17.0,  6.0 / 17.0
+        };
 
-            float3 spec_f0 = float3(0.04, 0.04, 0.04);
-            float roughness = 0.02;
+        // TODO: precompute these?
+        float3 region_start = load_region_pos();
+        float cell_size = load_cell_size();
+        float margin = REGION_MARGIN * cell_size;
+        float3 region_size = REGION_SIZE * cell_size;
 
-            float4 base = input.color;
-            #if defined(DRAW_SELECTION)
-                base.rgb += float3(0.2,0.4,0.2);
+        float3 region_end  = region_start + region_size;
+        float3 pos_centered = input.wp - region_start - region_size / 2.0;
+
+        float3 pabs = abs(pos_centered - region_size / 2.0);
+        float pmax = max(pabs.x, max(pabs.y, pabs.z));
+        //input.color.a *= 1.0 - smoothstep(0, margin, sdBox(pos_centered, region_size / 2.0 - margin));
+        //input.color.a *= smoothstep((region_size.x - margin) / 2.0, region_size.x / 2.0, pmax);
+
+        float3 pcenter = input.wp - load_lod_center();
+        //input.color.a *= 1.0 - smoothstep(-32.0, 0.0, sdBox(pcenter, load_lod_size() / 2.0));
+
+        clip(input.color.a - thresholdMatrix[input.position.x % 4][input.position.y % 4]);
+
+        float3 wn = normalize(input.wn);
+
+        float3 blend = blends(wn);
+        SamplerState sampler = get_default_sampler();
+        float3 normal = triplanar_normal_whiteout(get_normal_map(0), get_normal_map(1), sampler, input.wp, wn, blend);
+        //normal = normalize(transform_direction_unnormalized(normal, (float3x3)load_tm()));
+        //normal = wn;
+        float3 color = triplanar_blend(get_diffuse_map(0), get_diffuse_map(1), sampler, input.wp, blend);
+        float ao = triplanar_blend(get_occlusion_map(0), get_occlusion_map(1), sampler, input.wp, blend).r;
+        float roughness = triplanar_blend(get_roughness_map(0), get_roughness_map(1), sampler, input.wp, blend).r;
+        //normal = magnum_density(input.wp).xyz;
+
+        const float3 dielectric_specular_f0 = float3(0.04, 0.04, 0.04);
+        float metallic = 0.f;
+        //float roughness = 1.0f;
+        //float ao = 1.f;
+        //roughness = 1.f;
+        //ao = 1.f;
+
+        float4 base = 0;
+
+        //base.r = abs(normal.y); // grass
+        //base.g = 1.0 - base.r; // stone
+        //base.b = 0.0;
+        //base.rgb = abs(magnum_density(input.wp).w);
+        //base.rgb = color;
+        base.rgb = load_cell_size() / 128.0;
+        //base.rgb = srgb_to_linear(get_diffuse().Sample(get_default_sampler(), float2(0.5, 0.5)).rgb);
+        float3 spec_f0 = lerp(dielectric_specular_f0, base.rgb, metallic);
+        base.rgb = lerp(base.rgb * (1 - dielectric_specular_f0), float3(0,0,0), metallic);
+
+        #if defined(GBUFFER)
+            #if defined(GBUFFER_AUX)
+                uint surface_mask = TM_SURFACE_PROPERTIES_MASK_ADVANCED_MODE;
+            #else
+                uint surface_mask = 0;
             #endif
-            output.buffer0 = float4(linear_to_gamma2(base.rgb), base.a);
+
+            output.buffer0 = float4(linear_to_gamma2(base.rgb), encode_surface_properties_mask(surface_mask));
+            float3 encoded_normal = encode_signed_oct(normal);
             output.buffer1 = float4(encoded_normal.xy, roughness, encoded_normal.z);
-            output.buffer2 = float4(linear_to_gamma2(spec_f0), 0);
+            output.buffer2 = float4(linear_to_gamma2(spec_f0), ao);
             float2 res = load_render_target_resolution();
             output.velocity = (((input.position.xy / res) * 2 - 1) * float2(1, -1) - (input.last_position.xy / input.last_position.z)) * 0.5f;
             return output;
-        #else
-            float opacity = 1.0f;
-
-            float3 normal = normalize(input.wn);
-            //normal = magnum_density(input.wp).xyz;
-
-            const float3 dielectric_specular_f0 = float3(0.04, 0.04, 0.04);
-            float metallic = 0.f;
-            float roughness = 1.0f;
-            float ao = 1.f;
-
-            float4 base = input.color;
-            //base.rgb = abs(magnum_density(input.wp).w);
-            float3 spec_f0 = lerp(dielectric_specular_f0, base.rgb, metallic);
-            base.rgb = lerp(base.rgb * (1 - dielectric_specular_f0), float3(0,0,0), metallic);
-
-            #if defined(GBUFFER)
-                #if defined(GBUFFER_AUX)
-                    uint surface_mask = TM_SURFACE_PROPERTIES_MASK_ADVANCED_MODE;
-                #else
-                    uint surface_mask = 0;
-                #endif
-
-                output.buffer0 = float4(linear_to_gamma2(base.rgb), encode_surface_properties_mask(surface_mask));
-                float3 encoded_normal = encode_signed_oct(normal);
-                output.buffer1 = float4(encoded_normal.xy, roughness, encoded_normal.z);
-                output.buffer2 = float4(linear_to_gamma2(spec_f0), ao);
-                float2 res = load_render_target_resolution();
-                output.velocity = (((input.position.xy / res) * 2 - 1) * float2(1, -1) - (input.last_position.xy / input.last_position.z)) * 0.5f;
-                return output;
-            #endif
         #endif
     ]]
 }
 
 compile : {
-    includes: [ "common", "encoding_decoding", "sampling", "bsdf", "magnum_common" ]
+    includes: [ "common", "encoding_decoding", "sampling", "bsdf", "color_spaces", "magnum_common" ]
     variations : [
         { systems: ["frame_system", "viewer_system", "vertex_buffer_system", "shadow_system" ] }
         { systems: ["frame_system", "viewer_system", "vertex_buffer_system", "gbuffer_system", "selection_system" ] }

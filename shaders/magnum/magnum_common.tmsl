@@ -65,7 +65,7 @@ common: [[
 
     #define NUM_OCTAVES 4
 
-    float fbm(float3 p, float a, float f) {
+    float fbm(float3 p, float a, float f, uint octaves) {
         float G = 0.5;
         float t = 0.0;
 
@@ -81,7 +81,7 @@ common: [[
             1.97,
         };
 
-        for(uint i = 0; i < NUM_OCTAVES; i++)
+        for(uint i = 0; i < octaves; i++)
         {
             t += a * noise(f * p);
             f *= muls[i];
@@ -90,39 +90,117 @@ common: [[
         return t;
     }
 
+    float4 noised( in float3 x ) {
+        float3 p = floor(x);
+        float3 w = frac(x);
+
+        float3 u = w*w*w*(w*(w*6.0-15.0)+10.0);
+        float3 du = 30.0*w*w*(w*(w-2.0)+1.0);
+
+        float n = p.x + 317.0*p.y + 157.0*p.z;
+
+        float a = hash1(n+0.0);
+        float b = hash1(n+1.0);
+        float c = hash1(n+317.0);
+        float d = hash1(n+318.0);
+        float e = hash1(n+157.0);
+        float f = hash1(n+158.0);
+        float g = hash1(n+474.0);
+        float h = hash1(n+475.0);
+
+        float k0 =   a;
+        float k1 =   b - a;
+        float k2 =   c - a;
+        float k3 =   e - a;
+        float k4 =   a - b - c + d;
+        float k5 =   a - c - e + g;
+        float k6 =   a - b - e + f;
+        float k7 = - a + b + c - d + e - f - g + h;
+
+        return float4( -1.0+2.0*(k0 + k1*u.x + k2*u.y + k3*u.z + k4*u.x*u.y + k5*u.y*u.z + k6*u.z*u.x + k7*u.x*u.y*u.z),
+                    2.0* du * float3( k1 + k4*u.y + k6*u.z + k7*u.y*u.z,
+                                    k2 + k5*u.z + k4*u.x + k7*u.z*u.x,
+                                    k3 + k6*u.x + k5*u.y + k7*u.x*u.y ) );
+    }
+
+    float4 fbmd( float3 x, float scale, float b, uint octaves) {
+
+        const float3x3 m3  = float3x3( 0.00,  0.80,  0.60,
+                            -0.80,  0.36, -0.48,
+                            -0.60, -0.48,  0.64 );
+        const float3x3 m3i = float3x3( 0.00, -0.80, -0.60,
+                            0.80,  0.36, -0.48,
+                            0.60, -0.48,  0.64 );
+
+        const float muls[9] = {
+            2.05,
+            1.92,
+            1.97,
+            2.03,
+            2.04,
+            1.94,
+            2.02,
+            2.03,
+            1.96,
+        };
+        x *= scale;
+
+        float s = 0.5;
+        float a = 0.0;
+        float3 d = 0.0;
+        float3x3 m = float3x3(1.0,0.0,0.0,
+        0.0,1.0,0.0,
+        0.0,0.0,1.0);
+        for( int i=0; i < octaves; i++ )
+        {
+            float4 n = noised(x);
+            a += b*n.x;          // accumulate values
+            d += b*mul(m, n.yzw);      // accumulate derivatives
+            b *= s;
+            x = muls[i]*mul(m3, x);
+            m = muls[i]*mul(m3i, m);
+        }
+
+        return float4(d * scale, a);
+    }
+
     float density(float3 p) {
-        return p.y + fbm(p / 500.0, 50.0, 2.0);
+        return p.y + fbm(p / 500.0, 50.0, 1.98, 4);
         //return p.y + (50.0 + 50.0 * cnoise(p / 100.0));
     }
 
-    float3 calcNormal(float3 p) {
-        float2 e = float2(1.0,-1.0)*0.5773*0.0005;
-        return normalize( e.xyy*density( p + e.xyy) +
-					  e.yyx*density( p + e.yyx) +
-					  e.yxy*density( p + e.yxy) +
-					  e.xxx*density( p + e.xxx) );
+    float3 calcNormal(float3 p, float cell_size) {
+        float2 k = float2(1.0,-1.0);
+        float h = cell_size * cell_size * 0.001;
+        return normalize( k.xyy*density( p + k.xyy * h) +
+					  k.yyx*density( p + k.yyx * h) +
+					  k.yxy*density( p + k.yxy * h) +
+					  k.xxx*density( p + k.xxx * h) );
     }
 
-    // xyz - normal, w - density
-    float4 magnum_density(float3 pos) {
-        float4 ret;
-        //float3 center = float3(30, 30, 30);
-        //float radius = 5;
+    float4 opU(float4 d1, float4 d2) {
+        return float4(lerp(d1.xyz, d2.xyz, step(d2.w, d1.w)), min(d1.w, d2.w));
+    }
 
-        //float3 diff = pos - center;
-        //float diff_len = length(diff);
-        //ret.w = diff_len - radius;
-        //ret.xyz = diff / diff_len;
+    float4 opSub(float4 d1, float4 d2) {
+        return float4(lerp(d1.xyz, d2.xyz, step(d1.w, -d2.w)), max(-d2.w, d1.w));
+    }
 
-        //ret.w = pos.y - 5;
-        //ret.xyz = float3(0, 1, 0);
-
-        //ret = sdBox(pos - center, float3(5, 5, 5));
-
-        ret.w = density(pos);
-        ret.xyz = calcNormal(pos);
-
+    float4 plains(float3 pos) {
+        float4 ret = 0;
+        ret += fbmd(pos, 0.000718, 200.0, 2);
+        ret += fbmd(pos, 0.01, 4.98, 5);
+        ret += fbmd(pos, 0.001, 100.0, 6);
         return ret;
+    }
+
+    float4 worms(float3 pos) {
+        float4 ret = 0;
+        ret.w = 12;
+
+        ret += fbmd(pos, 0.000718, 30.0, 2);
+
+        return -ret;
     }
 
     float4 sphere_density(float3 p, float3 c, float r) {
@@ -136,21 +214,61 @@ common: [[
         return ret;
     }
 
+    float4 sphered(float3 p, float3 c, float r) {
+        float4 ret;
+
+        float3 diff = p - c;
+        float diff_len = length(diff);
+        ret.w = diff_len - r;
+        ret.xyz = diff / diff_len;// / diff_len;
+
+        return ret;
+    }
+
+    // xyz - normal, w - density
+    float4 magnum_density(float3 pos, float cell_size) {
+        float4 ret;
+        ret.w = pos.y + 100;
+        ret.xyz = float3(0, 1, 0);
+
+        ret = worms(pos);
+        //ret += plains(pos);
+        //ret = opUnion(ret, worms(pos));
+        //ret = sphered(pos, 0, 100);
+
+        //density += fbmd(pos, 0.000888, 200.0, 16.21, 2, derivative);
+
+        //density += fbmd(pos, 0.0888, 200.0, 16.21, 2, derivative);
+        //density += saturate((-4 - ws_orig.y*0.3)*3.0)*40 * uulf_rand2.z;
+
+        //ret.w = density(pos);
+        //ret.xyz = calcNormal(pos, cell_size);
+
+        ret.xyz = normalize(ret.xyz);
+
+        return ret;
+    }
+
+    float density_bias(float cell_size) {
+        //return 0;
+        return -((cell_size) - 4.0) * 0.05;
+    }
+
     uint flat_offset(uint x, uint y, uint z) {
         return x * REGION_SIZE * REGION_SIZE + y * REGION_SIZE + z;
     }
 
     float3 trilerp(float3 corners[2][2][2], float3 c) {
         // Trilinear interpolation
-        float3 fx1 = lerp(corners[0][0][0], corners[1][0][0], c.x);
-        float3 fx2 = lerp(corners[0][0][1], corners[1][0][1], c.x);
-        float3 fx3 = lerp(corners[0][1][0], corners[1][1][0], c.x);
-        float3 fx4 = lerp(corners[0][1][1], corners[1][1][1], c.x);
+        float3 yz00 = lerp(corners[0][0][0], corners[1][0][0], c.x);
+        float3 yz01 = lerp(corners[0][0][1], corners[1][0][1], c.x);
+        float3 yz10 = lerp(corners[0][1][0], corners[1][1][0], c.x);
+        float3 yz11 = lerp(corners[0][1][1], corners[1][1][1], c.x);
 
-        float3 fy1 = lerp(fx1, fx3, c.y);
-        float3 fy2 = lerp(fx2, fx4, c.y);
+        float3 z0 = lerp(yz00, yz10, c.y);
+        float3 z1 = lerp(yz01, yz11, c.y);
 
-        return lerp(fy1, fy2, c.z);
+        return lerp(z0, z1, c.z);
     }
 
     float trilerp(float corners[2][2][2], float3 c) {

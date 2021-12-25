@@ -41,6 +41,7 @@ compute_shader: {
         float3 pos = region_pos + ((float3)dispatch_thread_id - margin.xxx) * cell_size;
         float4 primitive_density;
         primitive_density = sphere_density(pos, load_primitive_position(), load_primitive_size().x);
+        primitive_density.w -= density_bias(cell_size);
 
         if ((primitive_density.w) < (cur_density)) {
             densities.Store(corner_idx * 4, asuint(primitive_density.w));

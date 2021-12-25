@@ -22,23 +22,25 @@ compute_shader: {
         float3 region_pos = load_region_pos();
         float cell_size = load_cell_size();
         float3 pos = (region_pos + ((float3)dispatch_thread_id - margin.xxx) * cell_size);
-        float4 density_ret = magnum_density(pos);
+        float4 density_ret = magnum_density(pos, cell_size);
+        density_ret.w -= density_bias(cell_size);
 
         uint corner_idx = flat_offset(dispatch_thread_id.x, dispatch_thread_id.y, dispatch_thread_id.z);
         get_densities().Store(corner_idx * 4, asuint(density_ret.w));
         get_normals().Store3(corner_idx * 12, asuint(density_ret.xyz));
 
-        RWByteAddressBuffer densities = get_densities();
-        RWByteAddressBuffer normals = get_normals();
+        //RWByteAddressBuffer densities = get_densities();
+        //RWByteAddressBuffer normals = get_normals();
 
-        float cur_density = density_ret.w;
+        //float cur_density = density_ret.w;
 
-        float4 primitive_density;
-        primitive_density = sphere_density(pos, float3(0, 0, 0), 20);
+        //float4 primitive_density;
+        //primitive_density = sphere_density(pos, float3(0, 0, 0), 20);
+        //primitive_density -= density_bias(cell_size);
 
-        if ((primitive_density.w) < (cur_density)) {
-            densities.Store(corner_idx * 4, asuint(primitive_density.w));
-            normals.Store3(corner_idx * 12, asuint(primitive_density.xyz));
-        }
+        //if ((primitive_density.w) < (cur_density)) {
+            //densities.Store(corner_idx * 4, asuint(primitive_density.w));
+            //normals.Store3(corner_idx * 12, asuint(primitive_density.xyz));
+        //}
     ]]
 }

@@ -193,19 +193,18 @@ common: [[
                 f[e] -= n[i] * edge_signs[e] * abs(dot(edges[e], n[i]) - d);
             }
         }
-        //c = saturate(c);
 
-        float last_dot = 0.0f;
-        for (uint iter = 0; iter < 10; ++iter) {
+        float last_dot = 10000000.f;
+        for (uint iter = 0; iter < 20; ++iter) {
             float3 f_total = trilerp(f, c);
 
             float len_sq = dot(f_total, f_total);
-            if (len_sq * 0.0025 < 0.00001) {
+            if (len_sq * 0.0025 < 0.001 || len_sq > last_dot) {
                 break;
             }
+            last_dot = len_sq;
 
             c += f_total * 0.05;
-            //c = saturate(c);
         }
         return c;
     }
@@ -416,7 +415,7 @@ compute_shader: {
             float3 vertex = (vertex_in_cell + cellf - margin) * cell_size;
 
             float3 normal = normalize(trilerp(n, vertex_in_cell));
-            //normal = magnum_density(vertex + load_region_pos()).xyz;
+            //normal = magnum_density(vertex + load_region_pos(), cell_size).xyz;
 
             uint vertex_offset = flat_offset(cell.x, cell.y, cell.z);
             get_vertices().Store3(vertex_offset * 12, asuint(vertex));
