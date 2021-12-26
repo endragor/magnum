@@ -23,7 +23,7 @@ static struct mag_terrain_api *mag_terrain_api;
 #include "plugins/mag_terrain_component/mag_terrain_component.h"
 
 #define MAX_OPS_PER_SECOND 5
-#define MAX_SCULPT_DISTANCE 31.0
+#define MAX_SCULPT_DISTANCE 120.0
 
 typedef struct tm_simulation_state_o
 {
@@ -69,7 +69,7 @@ static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
     if (mag_terrain_api->cast_ray(state->terrain_mgr, cursor_pos, cursor_dir, MAX_SCULPT_DISTANCE, &hit_length)) {
         state->last_op_time = args->time;
         tm_vec3_t pos = tm_vec3_add(cursor_pos, tm_vec3_mul(cursor_dir, hit_length));
-        mag_terrain_api->apply_operation(state->terrain_mgr, TERRAIN_OP_UNION, TERRAIN_OP_SPHERE, pos, (tm_vec3_t) { 2, 0, 0 });
+        mag_terrain_api->apply_operation(state->terrain_mgr, TERRAIN_OP_UNION, TERRAIN_OP_SPHERE, pos, (tm_vec3_t) { 8, 8, 8 });
     }
 }
 

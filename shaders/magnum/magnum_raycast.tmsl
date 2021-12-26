@@ -2,6 +2,7 @@ imports: [
     { name: "region_densities" type: "buffer" elements: 4 }
     { name: "region_positions" type: "float3" elements: 4 }
     { name: "region_count" type: "uint" }
+    { name: "cell_size" type: "float" }
 
     { name: "ray_start" type: "float3" }
     { name: "ray_dir" type: "float3" }
@@ -21,8 +22,9 @@ compute_shader: {
         float3 ro = load_ray_start();
         float3 rd = load_ray_dir();
         float max_length = load_ray_max_length();
-        float3 region_size = float3(REGION_SIZE, REGION_SIZE, REGION_SIZE);
-        float3 margin = float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN);
+        float cell_size = load_cell_size();
+        float3 region_size = float3(REGION_SIZE, REGION_SIZE, REGION_SIZE) * cell_size;
+        float3 margin = float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN) * cell_size;
 
         float cur_length = 0;
         uint region_count = load_region_count();
@@ -34,12 +36,13 @@ compute_shader: {
                 bool3 is_inside = inner_point >= 0 && inner_point < region_size;
                 if (is_inside.x && is_inside.y && is_inside.z) {
                     had_inside = true;
-                    float3 cellf = floor(inner_point);
+                    float3 cell_point = inner_point / cell_size;
+                    float3 cellf = floor(cell_point);
                     uint3 cell = (uint3) cellf;
 
                     float v[2][2][2];
                     load_cell_densities(get_region_densities(i), cell, v);
-                    float density = trilerp(v, inner_point - cellf);
+                    float density = trilerp(v, cell_point - cellf);
                     if (density < 0.001) {
                         get_ray_hit().Store(0, cur_length);
                         return;
