@@ -1,20 +1,34 @@
+static struct tm_api_registry_api *tm_global_api_registry;
 static struct tm_entity_api *tm_entity_api;
 static struct tm_simulation_api *tm_simulation_api;
 static struct tm_camera_api *tm_camera_api;
 static struct tm_ui_api *tm_ui_api;
 static struct tm_tag_component_api *tm_tag_component_api;
+static struct tm_the_truth_assets_api *tm_the_truth_assets_api;
+static struct tm_render_component_api *tm_render_component_api;
+static struct tm_transform_component_api *tm_transform_component_api;
+static struct tm_creation_graph_api *tm_creation_graph_api;
+static struct tm_temp_allocator_api *tm_temp_allocator_api;
 
 static struct mag_terrain_api *mag_terrain_api;
 
 #include <foundation/allocator.h>
 #include <foundation/api_registry.h>
 #include <foundation/camera.h>
+#include <foundation/carray.inl>
 #include <foundation/localizer.h>
 #include <foundation/math.inl>
 #include <foundation/rect.inl>
+#include <foundation/temp_allocator.h>
+#include <foundation/the_truth.h>
+#include <foundation/the_truth_assets.h>
 
+#include <plugins/creation_graph/creation_graph.h>
 #include <plugins/entity/entity.h>
 #include <plugins/entity/tag_component.h>
+#include <plugins/entity/transform_component.h>
+#include <plugins/render_utilities/render_component.h>
+#include <plugins/renderer/render_backend.h>
 #include <plugins/simulation/simulation.h>
 #include <plugins/simulation/simulation_entry.h>
 #include <plugins/ui/ui.h>
@@ -30,9 +44,16 @@ typedef struct tm_simulation_state_o
     tm_allocator_i *allocator;
     tm_simulation_o *simulation_ctx;
     tm_entity_context_o *entity_ctx;
+    tm_the_truth_o *tt;
+    tm_renderer_backend_i *rb;
+
+    tm_component_type_t render_comp_type;
+    tm_transform_component_manager_o *transform_man;
+    tm_entity_t sphere_aim;
+    // either sphere aim or box aim
+    tm_entity_t sculpt_aim;
 
     mag_terrain_component_manager_o *terrain_mgr;
-
     double last_op_time;
 } tm_simulation_state_o;
 
@@ -45,14 +66,34 @@ static void private__cursor_line(const tm_camera_t *camera, tm_vec2_t mouse_pos,
     *cursor_dir = tm_vec3_normalize(tm_vec3_sub(cursor_world[1], cursor_world[0]));
 }
 
+static void update_aim_radius(tm_simulation_state_o *state, tm_entity_t aim, float radius)
+{
+    TM_INIT_TEMP_ALLOCATOR(ta);
+
+    tm_creation_graph_instance_t **instances = tm_creation_graph_api->get_instances_from_component(state->tt, state->entity_ctx, aim, TM_TT_TYPE_HASH__RENDER_COMPONENT, ta);
+    tm_creation_graph_context_t ctx = (tm_creation_graph_context_t) { .rb = state->rb, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, .tt = state->tt };
+
+    for (uint32_t instance_idx = 0; instance_idx < tm_carray_size(instances); ++instance_idx) {
+        tm_creation_graph_instance_t *instance = instances[instance_idx];
+        tm_creation_graph_api->set_input_value(instance, &ctx, TM_STATIC_HASH("Radius", 0xabb1bd83748b60e4ULL), &radius, sizeof(radius));
+        tm_creation_graph_api->refresh_outputs(instance, &ctx);
+    }
+
+    TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
+}
+
+static void update_render_visibility(tm_simulation_state_o *state, tm_entity_t e, bool visible)
+{
+    tm_render_component_public_t *render_comp = tm_entity_api->get_component(state->entity_ctx, e, state->render_comp_type);
+    tm_render_component_api->set_draws_enable(render_comp, visible);
+}
+
 static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
 {
-    if (!args->ui || args->time - state->last_op_time < 1.0 / MAX_OPS_PER_SECOND)
+    if (!args->ui)
         return;
 
     tm_ui_buffers_t uib = tm_ui_api->buffers(args->ui);
-    if (!uib.input->left_mouse_is_down)
-        return;
 
     if (!tm_vec2_in_rect(uib.input->mouse_pos, args->rect))
         return;
@@ -66,10 +107,16 @@ static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
     private__cursor_line(camera, uib.input->mouse_pos, args->rect, &cursor_pos, &cursor_dir);
 
     float hit_length;
-    if (mag_terrain_api->cast_ray(state->terrain_mgr, cursor_pos, cursor_dir, MAX_SCULPT_DISTANCE, &hit_length)) {
-        state->last_op_time = args->time;
+    bool ray_intersects = mag_terrain_api->cast_ray(state->terrain_mgr, cursor_pos, cursor_dir, MAX_SCULPT_DISTANCE, &hit_length);
+    update_render_visibility(state, state->sculpt_aim, ray_intersects);
+    if (ray_intersects) {
         tm_vec3_t pos = tm_vec3_add(cursor_pos, tm_vec3_mul(cursor_dir, hit_length));
-        mag_terrain_api->apply_operation(state->terrain_mgr, TERRAIN_OP_UNION, TERRAIN_OP_SPHERE, pos, (tm_vec3_t) { 8, 8, 8 });
+        if (uib.input->left_mouse_is_down && (args->time - state->last_op_time >= 1.0 / MAX_OPS_PER_SECOND)) {
+            state->last_op_time = args->time;
+            mag_terrain_api->apply_operation(state->terrain_mgr, TERRAIN_OP_UNION, TERRAIN_OP_SPHERE, pos, (tm_vec3_t) { 16, 16, 16 });
+        }
+        tm_transform_component_api->set_local_position(state->transform_man, state->sculpt_aim, pos);
+        update_aim_radius(state, state->sculpt_aim, 32.f);
     }
 }
 
@@ -81,6 +128,8 @@ static tm_simulation_state_o *start(tm_simulation_start_args_t *args)
         .entity_ctx = args->entity_ctx,
         .simulation_ctx = args->simulation_ctx,
         .last_op_time = -1.0 / MAX_OPS_PER_SECOND,
+        .tt = args->tt,
+        .rb = tm_first_implementation(tm_global_api_registry, tm_renderer_backend_i),
     };
     tm_component_type_t tag_component = tm_entity_api->lookup_component_type(state->entity_ctx, TM_TT_TYPE_HASH__TAG_COMPONENT);
     tm_tag_component_manager_o *tag_mgr = (tm_tag_component_manager_o *)tm_entity_api->component_manager(state->entity_ctx, tag_component);
@@ -90,6 +139,15 @@ static tm_simulation_state_o *start(tm_simulation_start_args_t *args)
 
     tm_component_type_t terrain_component = tm_entity_api->lookup_component_type(state->entity_ctx, MAG_TT_TYPE_HASH__TERRAIN_COMPONENT);
     state->terrain_mgr = (mag_terrain_component_manager_o *)tm_entity_api->component_manager(state->entity_ctx, terrain_component);
+
+    tm_tt_id_t sphere_aim_asset = tm_the_truth_assets_api->asset_object_from_path(args->tt, args->asset_root, "sculpt/sphere.entity");
+    state->sphere_aim = tm_entity_api->create_entity_from_asset(state->entity_ctx, sphere_aim_asset);
+    state->sculpt_aim = state->sphere_aim;
+
+    state->render_comp_type = tm_entity_api->lookup_component_type(state->entity_ctx, TM_TT_TYPE_HASH__RENDER_COMPONENT);
+    state->transform_man = (tm_transform_component_manager_o *)tm_entity_api->component_manager_by_hash(state->entity_ctx, TM_TT_TYPE_HASH__TRANSFORM_COMPONENT);
+
+    update_render_visibility(state, state->sculpt_aim, false);
 
     return state;
 }
@@ -110,12 +168,17 @@ static tm_simulation_entry_i simulation_entry_i = {
 
 TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
 {
-
+    tm_global_api_registry = reg;
     tm_entity_api = tm_get_api(reg, tm_entity_api);
     tm_simulation_api = tm_get_api(reg, tm_simulation_api);
     tm_ui_api = tm_get_api(reg, tm_ui_api);
     tm_camera_api = tm_get_api(reg, tm_camera_api);
     tm_tag_component_api = tm_get_api(reg, tm_tag_component_api);
+    tm_the_truth_assets_api = tm_get_api(reg, tm_the_truth_assets_api);
+    tm_render_component_api = tm_get_api(reg, tm_render_component_api);
+    tm_transform_component_api = tm_get_api(reg, tm_transform_component_api);
+    tm_creation_graph_api = tm_get_api(reg, tm_creation_graph_api);
+    tm_temp_allocator_api = tm_get_api(reg, tm_temp_allocator_api);
 
     mag_terrain_api = tm_get_api(reg, mag_terrain_api);
 

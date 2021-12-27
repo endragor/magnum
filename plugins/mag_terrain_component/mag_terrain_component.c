@@ -1746,7 +1746,8 @@ static bool aabb_segment_intersect(const aabb_t *aabb, tm_vec3_t start, tm_vec3_
 static bool cast_ray(mag_terrain_component_manager_o *man, tm_vec3_t ray_start, tm_vec3_t ray_dir, float max_distance, float *hit_distance)
 {
     float lod0_size = LODS[0].size * (float)MAG_VOXEL_CHUNK_SIZE;
-    TM_ASSERT(max_distance < lod0_size, tm_error_api->def, "max ray distance (%f) beyond region size (%f) is not supported", max_distance, lod0_size);
+    if (!TM_ASSERT(max_distance < lod0_size, tm_error_api->def, "max ray distance (%f) beyond region size (%f) is not supported", max_distance, lod0_size))
+        return false;
     tm_vec3_t chunk_size = { lod0_size, lod0_size, lod0_size };
 
     tm_renderer_handle_t region_densities[5];
@@ -1833,8 +1834,8 @@ check_count:
 
     uint64_t sort_key = UINT64_MAX;
     tm_renderer_api->tm_renderer_command_buffer_api->bind_queue(cmd_buf, sort_key, &(tm_renderer_queue_bind_t) { .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL });
-    uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
 
+    uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
     uint32_t rr = tm_renderer_api->tm_renderer_command_buffer_api->read_buffer(cmd_buf, sort_key, &(tm_renderer_read_buffer_t) { .resource_handle = result_handle, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, .resource_state = state, .resource_queue = TM_RENDERER_QUEUE_GRAPHICS, .bits = hit_distance, .size = sizeof(float) });
 
     rb->submit_resource_command_buffers(rb->inst, &res_buf, 1);

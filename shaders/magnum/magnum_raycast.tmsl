@@ -23,7 +23,7 @@ compute_shader: {
         float3 rd = load_ray_dir();
         float max_length = load_ray_max_length();
         float cell_size = load_cell_size();
-        float3 region_size = float3(REGION_SIZE, REGION_SIZE, REGION_SIZE) * cell_size;
+        float3 region_size = float3(REGION_SIZE, REGION_SIZE, REGION_SIZE);
         float3 margin = float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN) * cell_size;
 
         float cur_length = 0;
@@ -32,22 +32,26 @@ compute_shader: {
             bool had_inside = false;
             float3 cur = ro + cur_length * rd;
             for (uint i = 0; i < region_count; ++i) {
-                float3 inner_point = cur - (load_region_positions(i) - margin);
+                float3 inner_point = (cur - (load_region_positions(i) - margin)) / cell_size;
                 bool3 is_inside = inner_point >= 0 && inner_point < region_size;
+                [branch]
                 if (is_inside.x && is_inside.y && is_inside.z) {
                     had_inside = true;
-                    float3 cell_point = inner_point / cell_size;
-                    float3 cellf = floor(cell_point);
+                    float3 cellf = floor(inner_point);
                     uint3 cell = (uint3) cellf;
 
-                    float v[2][2][2];
-                    load_cell_densities(get_region_densities(i), cell, v);
-                    float density = trilerp(v, cell_point - cellf);
+                    // didn't work for some reason :(
+                    //float v[2][2][2];
+                    //load_cell_densities(get_region_densities(i), cell, v);
+                    //float density = trilerp(v, frac(inner_point));
+                    float density = asfloat(get_region_densities(i).Load(flat_offset(cell.x, cell.y, cell.z) * 4));
+                    cur_length += density * 0.95;
+                    [branch]
                     if (density < 0.001) {
-                        get_ray_hit().Store(0, cur_length);
+                        get_ray_hit().Store(0, asuint(cur_length));
                         return;
                     }
-                    cur_length += density * 0.95;
+                    [branch]
                     if (cur_length > max_length) {
                         get_ray_hit().Store(0, asuint(-9999.0));
                         return;
@@ -55,6 +59,7 @@ compute_shader: {
                     break;
                 }
             }
+            [branch]
             if (!had_inside) {
                 get_ray_hit().Store(0, asuint(-9999.0));
                 return;
