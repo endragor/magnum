@@ -284,28 +284,58 @@ common: [[
         return lerp(fy1, fy2, c.z);
     }
 
-    float2 load2at1(ByteAddressBuffer b, uint3 offset) {
-        return asfloat(b.Load2(flat_offset(offset.x, offset.y, offset.z) * 4));
+    float3 trilerp(float4 corners[2][2][2], float3 c) {
+        // Trilinear interpolation
+        float3 fx1 = lerp(corners[0][0][0].xyz, corners[1][0][0].xyz, c.x);
+        float3 fx2 = lerp(corners[0][0][1].xyz, corners[1][0][1].xyz, c.x);
+        float3 fx3 = lerp(corners[0][1][0].xyz, corners[1][1][0].xyz, c.x);
+        float3 fx4 = lerp(corners[0][1][1].xyz, corners[1][1][1].xyz, c.x);
+
+        float3 fy1 = lerp(fx1, fx3, c.y);
+        float3 fy2 = lerp(fx2, fx4, c.y);
+
+        return lerp(fy1, fy2, c.z);
     }
 
-    void load_cell_densities(ByteAddressBuffer densities, uint3 cell, out float v[2][2][2]) {
-        float2 v00 = load2at1(densities, cell + uint3(0, 0, 0));
-        float2 v01 = load2at1(densities, cell + uint3(0, 1, 0));
-        float2 v10 = load2at1(densities, cell + uint3(1, 0, 0));
-        float2 v11 = load2at1(densities, cell + uint3(1, 1, 0));
 
-        const float dens[2][2][2] = {
-            v00.x,
-            v00.y,
-            v01.x,
-            v01.y,
-            v10.x,
-            v10.y,
-            v11.x,
-            v11.y,
-        };
+    float4 unpack_density(uint2 d) {
+        return float4(
+            f16tof32(d.x & 0xFFFF),
+            f16tof32((d.x & 0xFFFF0000) >> 16),
+            f16tof32(d.y & 0xFFFF),
+            f16tof32((d.y & 0xFFFF0000) >> 16)
+        );
+    }
 
-        v = dens;
+    float4 load_density(ByteAddressBuffer b, uint3 offset) {
+        uint2 d = b.Load2(flat_offset(offset.x, offset.y, offset.z) * 8);
+        return unpack_density(d);
+    }
+
+    float4 load_density(RWByteAddressBuffer b, uint3 offset) {
+        uint2 d = b.Load2(flat_offset(offset.x, offset.y, offset.z) * 8);
+        return unpack_density(d);
+    }
+
+    void load_two_densities(ByteAddressBuffer b, uint3 offset, out float4 densities[2]) {
+        uint4 d = b.Load4(flat_offset(offset.x, offset.y, offset.z) * 8);
+        densities[0] = unpack_density(d.xy);
+        densities[1] = unpack_density(d.zw);
+    }
+
+    void store_density(RWByteAddressBuffer b, uint3 offset, float4 d) {
+        uint2 packed = uint2(
+            f32tof16(d.x) | (f32tof16(d.y) << 16),
+            f32tof16(d.z) | (f32tof16(d.w) << 16)
+        );
+        b.Store2(flat_offset(offset.x, offset.y, offset.z) * 8, packed);
+    }
+
+    void load_cell_densities(ByteAddressBuffer densities, uint3 cell, out float4 v[2][2][2]) {
+        load_two_densities(densities, cell + uint3(0, 0, 0), v[0][0]);
+        load_two_densities(densities, cell + uint3(0, 1, 0), v[0][1]);
+        load_two_densities(densities, cell + uint3(1, 0, 0), v[1][0]);
+        load_two_densities(densities, cell + uint3(1, 1, 0), v[1][1]);
     }
 ]]
 

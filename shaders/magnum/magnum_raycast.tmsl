@@ -44,7 +44,7 @@ compute_shader: {
                     //float v[2][2][2];
                     //load_cell_densities(get_region_densities(i), cell, v);
                     //float density = trilerp(v, frac(inner_point));
-                    float density = asfloat(get_region_densities(i).Load(flat_offset(cell.x, cell.y, cell.z) * 4));
+                    float density = load_density(get_region_densities(i), cell).w;
                     cur_length += density * 0.95;
                     [branch]
                     if (density < 0.001) {

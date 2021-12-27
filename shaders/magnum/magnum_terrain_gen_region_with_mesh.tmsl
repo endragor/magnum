@@ -3,10 +3,8 @@ imports: [
     { name: "cell_size" type: "float" }
 
     { name: "densities" type: "buffer" }
-    { name: "normals" type: "buffer" }
     { name: "region_indirect" type: "buffer" uav: true }
     { name: "vertices" type: "buffer" uav: true }
-    { name: "vertex_normals" type: "buffer" uav: true }
     { name: "triangles" type: "buffer" uav: true }
 ]
 
@@ -208,10 +206,6 @@ common: [[
         }
         return c;
     }
-
-    float3 load3(ByteAddressBuffer b, uint3 offset) {
-        return asfloat(b.Load3(flat_offset(offset.x, offset.y, offset.z) * 12));
-    }
 ]]
 
 compute_shader: {
@@ -224,22 +218,8 @@ compute_shader: {
     code: [[
         uint3 cell = dispatch_thread_id;
 
-        ByteAddressBuffer densities = get_densities();
-        ByteAddressBuffer region_normals = get_normals();
-
-        float v[2][2][2];
-        load_cell_densities(densities, cell, v);
-
-        const float3 n[2][2][2] = {
-            load3(region_normals, cell + uint3(0, 0, 0)),
-            load3(region_normals, cell + uint3(0, 0, 1)),
-            load3(region_normals, cell + uint3(0, 1, 0)),
-            load3(region_normals, cell + uint3(0, 1, 1)),
-            load3(region_normals, cell + uint3(1, 0, 0)),
-            load3(region_normals, cell + uint3(1, 0, 1)),
-            load3(region_normals, cell + uint3(1, 1, 0)),
-            load3(region_normals, cell + uint3(1, 1, 1)),
-        };
+        float4 v[2][2][2];
+        load_cell_densities(get_densities(), cell, v);
 
         float3 cellf = (float3)cell;
         uint3 cellout = (uint3)step(float3(1, 1, 1), cellf);
@@ -257,26 +237,17 @@ compute_shader: {
         {
             for (uint dx = 0; dx != 2; ++dx) {
                 for (uint dy = 0; dy != 2; ++dy) {
-                    float v0 = v[dx][dy][0];
-                    float v1 = v[dx][dy][1];
+                    float v0 = v[dx][dy][0].w;
+                    float v1 = v[dx][dy][1].w;
                     float solid0 = step(v0, 0);
                     float solid1 = step(v1, 0);
                     if (solid0 != solid1) {
                         float distance = v0 / (v0 - v1);
-                        distance = abs(distance);
-                        float sign0 = -solid0 * 2 + 1;
-                        float sign1 = -solid1 * 2 + 1;
-                        sign0 = -sign0;
-                        sign1 = -sign1;
-                        float nz = (sign1 * v1 - sign0 * v0) / distance;
-                        float ny = lerp(sign1 * v[dx][1][0] - sign0 * v[dx][0][0], sign1 * v[dx][1][1] - sign0 * v[dx][0][1], distance);
-                        float nx = lerp(sign1 * v[1][dy][0] - sign0 * v[0][dy][0], sign1 * v[1][dy][1] - sign0 * v[0][dy][1], distance);
-                        //distance = abs(distance);
                         changes[change_idx] = float3((float)dx, (float)dy, distance);
-                        normals[change_idx] = normalize(lerp(n[dx][dy][0], n[dx][dy][1], distance));
-                        normals[change_idx] = trilerp(n, changes[change_idx]);
+                        normals[change_idx] = normalize(lerp(v[dx][dy][0].xyz, v[dx][dy][1].xyz, distance));
+                        //normals[change_idx] = trilerp(v, changes[change_idx]);
                         //normals[change_idx] = normalize(float3(nx, ny, nz));
-                        //normals[change_idx] = magnum_density((cellf + changes[change_idx] - margin) * cell_size + load_region_pos()).xyz;
+                        //normals[change_idx] = magnum_density((cellf + changes[change_idx] - margin) * cell_size + load_region_pos(), cell_size).xyz;
                         ++change_idx;
 
                         if ((1 - dx) & (1 - dy) & cellout.x && cellout.y) {
@@ -308,23 +279,16 @@ compute_shader: {
         {
             for (uint dx = 0; dx != 2; ++dx) {
                 for (uint dz = 0; dz != 2; ++dz) {
-                    float v0 = v[dx][0][dz];
-                    float v1 = v[dx][1][dz];
+                    float v0 = v[dx][0][dz].w;
+                    float v1 = v[dx][1][dz].w;
                     float solid0 = step(v0, 0);
                     float solid1 = step(v1, 0);
                     if (solid0 != solid1) {
                         float distance = v0 / (v0 - v1);
-                        float sign0 = -solid0 * 2 + 1;
-                        float sign1 = -solid1 * 2 + 1;
-                        distance = abs(distance);
-                        float ny = (sign1 * v1 - sign0 * v0) / distance;
-                        float nx = lerp(sign1 * v[1][0][dz] - sign0 * v[0][0][dz], sign1 * v[1][1][dz] - sign0 * v[0][1][dz], distance);
-                        float nz = lerp(sign1 * v[dx][0][1] - sign0 * v[0][0][0], sign1 * v[dx][1][1] - sign0 * v[0][1][0], distance);
                         changes[change_idx] = float3((float)dx, distance, (float)dz);
-                        normals[change_idx] = normalize(lerp(n[dx][0][dz], n[dx][1][dz], distance));
-                        normals[change_idx] = trilerp(n, changes[change_idx]);
-                        //normals[change_idx] = normalize(float3(nx, ny, nz));
-                        //normals[change_idx] = magnum_density((cellf + changes[change_idx] - margin) * cell_size + load_region_pos()).xyz;
+                        normals[change_idx] = normalize(lerp(v[dx][0][dz].xyz, v[dx][1][dz].xyz, distance));
+                        //normals[change_idx] = trilerp(v, changes[change_idx]);
+                        //normals[change_idx] = magnum_density((cellf + changes[change_idx] - margin) * cell_size + load_region_pos(), cell_size).xyz;
                         ++change_idx;
 
                         if ((1 - dx) & (1 - dz) & cellout.x & cellout.z) {
@@ -356,23 +320,16 @@ compute_shader: {
         {
             for (uint dy = 0; dy != 2; ++dy) {
                 for (uint dz = 0; dz != 2; ++dz) {
-                    float v0 = v[0][dy][dz];
-                    float v1 = v[1][dy][dz];
+                    float v0 = v[0][dy][dz].w;
+                    float v1 = v[1][dy][dz].w;
                     float solid0 = step(v0, 0);
                     float solid1 = step(v1, 0);
                     if (solid0 != solid1) {
                         float distance = v0 / (v0 - v1);
-                        distance = abs(distance);
-                        float sign0 = -solid0 * 2 + 1;
-                        float sign1 = -solid1 * 2 + 1;
-                        float nx = (sign1 * v1 - sign0 * v0) / distance;
-                        float ny = lerp(sign1 * v[0][1][dz] - sign0 * v[0][0][dz], sign1 * v[1][1][dz] - sign0 * v[1][0][dz], distance);
-                        float nz = lerp(sign1 * v[0][dy][1] - sign0 * v[0][dy][0], sign1 * v[1][dy][1] - sign0 * v[1][dy][0], distance);
                         changes[change_idx] = float3(distance, (float)dy, (float)dz);
-                        normals[change_idx] = normalize(lerp(n[0][dy][dz], n[1][dy][dz], distance));
-                        normals[change_idx] = trilerp(n, changes[change_idx]);
-                        //normals[change_idx] = normalize(float3(nx, ny, nz));
-                        //normals[change_idx] = magnum_density((cellf + changes[change_idx] - margin) * cell_size + load_region_pos()).xyz;
+                        normals[change_idx] = normalize(lerp(v[0][dy][dz].xyz, v[1][dy][dz].xyz, distance));
+                        //normals[change_idx] = trilerp(v, changes[change_idx]);
+                        //normals[change_idx] = magnum_density((cellf + changes[change_idx] - margin) * cell_size + load_region_pos(), cell_size).xyz;
                         ++change_idx;
 
                         if ((1 - dy) & (1 - dz) & cellout.y & cellout.z) {
@@ -402,21 +359,22 @@ compute_shader: {
 
         if (change_idx >= 1) {
             const float edge_signs[2][2][2] = {
-                step(0, v[0][0][0]) * 2 - 1,
-                step(0, v[0][0][1]) * 2 - 1,
-                step(0, v[0][1][0]) * 2 - 1,
-                step(0, v[0][1][1]) * 2 - 1,
-                step(0, v[1][0][0]) * 2 - 1,
-                step(0, v[1][0][1]) * 2 - 1,
-                step(0, v[1][1][0]) * 2 - 1,
-                step(0, v[1][1][1]) * 2 - 1,
+                step(0, v[0][0][0].w) * 2 - 1,
+                step(0, v[0][0][1].w) * 2 - 1,
+                step(0, v[0][1][0].w) * 2 - 1,
+                step(0, v[0][1][1].w) * 2 - 1,
+                step(0, v[1][0][0].w) * 2 - 1,
+                step(0, v[1][0][1].w) * 2 - 1,
+                step(0, v[1][1][0].w) * 2 - 1,
+                step(0, v[1][1][1].w) * 2 - 1,
             };
             float3 vertex_in_cell = find_vertex(changes, normals, edge_signs, change_idx);
 
-            float3 wn = normalize(trilerp(n, vertex_in_cell));
-            //wn = magnum_density(vertex + load_region_pos(), cell_size).xyz;
-
             float3 wp = load_region_pos() + (vertex_in_cell + cellf - margin) * cell_size;
+            float3 wn = normalize(trilerp(v, vertex_in_cell));
+            //wn = magnum_density(wp, cell_size).xyz;
+            //wn = v[0][0][0].xyz;
+
             uint3 vertex_data = uint3(
                 f32tof16(wp.x) | (f32tof16(wp.y) << 16),
                 f32tof16(wp.z) | (f32tof16(wn.x) << 16),
