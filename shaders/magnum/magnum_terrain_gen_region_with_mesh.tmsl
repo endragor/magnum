@@ -412,14 +412,19 @@ compute_shader: {
                 step(0, v[1][1][1]) * 2 - 1,
             };
             float3 vertex_in_cell = find_vertex(changes, normals, edge_signs, change_idx);
-            float3 vertex = (vertex_in_cell + cellf - margin) * cell_size;
 
-            float3 normal = normalize(trilerp(n, vertex_in_cell));
-            //normal = magnum_density(vertex + load_region_pos(), cell_size).xyz;
+            float3 wn = normalize(trilerp(n, vertex_in_cell));
+            //wn = magnum_density(vertex + load_region_pos(), cell_size).xyz;
+
+            float3 wp = load_region_pos() + (vertex_in_cell + cellf - margin) * cell_size;
+            uint3 vertex_data = uint3(
+                f32tof16(wp.x) | (f32tof16(wp.y) << 16),
+                f32tof16(wp.z) | (f32tof16(wn.x) << 16),
+                f32tof16(wn.y) | (f32tof16(wn.z) << 16)
+            );
 
             uint vertex_offset = flat_offset(cell.x, cell.y, cell.z);
-            get_vertices().Store3(vertex_offset * 12, asuint(vertex));
-            get_vertex_normals().Store3(vertex_offset * 12, asuint(normal));
+            get_vertices().Store3(vertex_offset * 12, vertex_data);
         }
     ]]
 }
