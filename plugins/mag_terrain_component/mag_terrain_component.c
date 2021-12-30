@@ -84,8 +84,8 @@ static const struct
 } LODS[] = {
     // { 64.f, 1.f, 15 },
     { 512.f, 4.f, 15 },
-    // { 1500.f, 10.f, 15 },
-    // { 3000.f, 32.f, 20 },
+    { 3000.f, 64.f, 15 },
+    //{ 3000.f, 64.f, 20 },
     // { 256.f, 2.f, 10 },
     // { 1024.f, 8.f, 16 },
     //{ 10000.f, 64.f, 20 },
@@ -133,8 +133,6 @@ typedef struct region_data_t
     tm_vec3_t pos;
     uint8_t lod;
     TM_PAD(3);
-    tm_vec3_t lod_center;
-    tm_vec3_t lod_size;
     uint64_t key;
 } region_data_t;
 
@@ -320,21 +318,19 @@ static uint64_t region_key(tm_vec3_t start, float lod_size, uint64_t lod_i)
 
 typedef struct TM_HASH_T(uint64_t, region_data_t) region_data_map_t;
 
-static void add_regions_from_aabb(const aabb_t *aabb, uint8_t lod_i, region_data_map_t *out_regions)
+static void add_regions_from_aabb(const aabb_t *aabb, uint8_t lod_i, const tm_vec3_t *exclude_min, const tm_vec3_t *exclude_max, region_data_map_t *out_regions)
 {
     float cell_size = LODS[lod_i].size;
-
     float lod_size = (float)MAG_VOXEL_CHUNK_SIZE * cell_size;
-
-    tm_vec3_t aabb_size = tm_vec3_sub(aabb->max, aabb->min);
-    tm_vec3_t lod_center = tm_vec3_add(aabb->min, tm_vec3_mul(aabb_size, 0.5f));
     for (float x = aabb->min.x; x < aabb->max.x; x += lod_size) {
         for (float y = aabb->min.y; y < aabb->max.y; y += lod_size) {
             for (float z = aabb->min.z; z < aabb->max.z; z += lod_size) {
+                bool exclude = x >= exclude_min->x && y >= exclude_min->y && z >= exclude_min->z && (x + lod_size) <= exclude_max->x && (y + lod_size) <= exclude_max->y && (z + lod_size) <= exclude_max->z;
+                if (exclude)
+                    continue;
+
                 region_data_t region = {
                     .pos = { x, y, z },
-                    .lod_size = aabb_size,
-                    .lod_center = lod_center,
                     .lod = lod_i,
                     .key = region_key((tm_vec3_t) { x, y, z }, lod_size, lod_i),
                 };
@@ -374,7 +370,7 @@ static void wanted_regions(tm_vec3_t camera_pos, region_data_map_t *out_regions)
         }
 
         for (uint32_t ai = 0; ai < aabb_count; ++ai) {
-            add_regions_from_aabb(partial_aabbs + ai, (uint8_t)i, out_regions);
+            add_regions_from_aabb(partial_aabbs + ai, (uint8_t)i, &prev_min, &prev_max, out_regions);
         }
 
         prev_min = lod_min;
@@ -1130,6 +1126,7 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
                 // TODO: rm
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("alpha", 0x3f6973542dd6a4fbULL), &component->color_rgba.w, sizeof(component->color_rgba.w));
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("cell_size", 0x50b5f09b4c1a94fdULL), &LODS[component->region_data.lod].size, sizeof(LODS[component->region_data.lod].size));
+                set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("region_pos", 0x5af0fcabdb39700fULL), &component->region_data.pos, sizeof(component->region_data.pos));
                 set_resource(io, args->default_resource_buffer, &rbinders[i], TM_STATIC_HASH("vertices", 0x3288dd4327525f9aULL), &component->buffers->vertices, 0, 0, 1);
                 if (material_count) {
                     set_resource(io, args->default_resource_buffer, &rbinders[i], TM_STATIC_HASH("diffuse_map", 0x3aa8b87edcc9a470ULL), man->terrain_settings.diffuse_maps, aspect_flags, 0, material_count);
