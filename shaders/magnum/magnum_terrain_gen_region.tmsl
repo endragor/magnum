@@ -16,7 +16,7 @@ compute_shader: {
     import_system_semantics: [ "dispatch_thread_id" ]
 
     attributes: {
-        num_threads: [36, 1, 1]
+        num_threads: [33, 1, 1]
     }
 
     code: [[

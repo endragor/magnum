@@ -1,0 +1,1119 @@
+// Implementation of octree for adaptive dual contouring
+
+imports: [
+    { name: "is_critical_cube" type: "uint" elements: 256 }
+]
+
+common: [[
+
+    #define OCTREE_DEPTH 5
+
+    #define OCTREE_NODE_SIZE 60
+    struct octree_node_t {
+        float3 diagA;
+        float3 upperA;
+        float4 bc;
+        float3 edge_sum;
+        // lower 8 bit - child mask, upper 24 bits - active edge count
+        uint child_mask;
+        uint vertex_id;
+    };
+
+    void add_cell(RWByteAddressBuffer octree, uint3 cell, octree_node_t node) {
+        uint3 c = uint3(REGION_SIZE >> 1, REGION_SIZE >> 1, REGION_SIZE >> 1);
+        uint3 s = c;
+        uint id = 0;
+        for (uint i = 0; i < OCTREE_DEPTH; ++i) {
+            uint3 idx3 = step(c, cell);
+            uint idx = (idx3.x << 2) | (idx3.y << 1) | (idx3.z << 0);
+            id = id * 8 + idx + 1;
+            s >>= 1;
+            c = c + idx3 * s - (1 - idx3) * s;
+        }
+
+        uint offset = OCTREE_NODE_SIZE * id;
+        octree.Store4(offset, uint4(node.child_mask, asuint(node.diagA)));
+        offset += 4 * 4;
+        octree.Store4(offset, uint4(asuint(node.upperA), node.vertex_id));
+        offset += 4 * 4;
+        octree.Store4(offset, asuint(node.bc));
+        offset += 4 * 4;
+        octree.Store3(offset, asuint(node.edge_sum));
+
+        uint old_mask = 0;
+        while (id && !old_mask) {
+            id -= 1;
+            uint mask_in_parent = (1u << (id & 7));
+            id = id >> 3;
+
+            uint parent_offset = OCTREE_NODE_SIZE * id;
+            octree.InterlockedOr(parent_offset, mask_in_parent, old_mask);
+        }
+    }
+
+    octree_node_t load_node(ByteAddressBuffer octree, uint id) {
+        octree_node_t ret;
+
+        uint offset = OCTREE_NODE_SIZE * id;
+        uint4 first = octree.Load4(offset);
+        ret.child_mask = first.x;
+        ret.diagA = asfloat(first.yzw);
+
+        offset += 4 * 4;
+        uint4 second = octree.Load4(offset);
+        ret.upperA = asfloat(second.xyz);
+        ret.vertex_id = second.w;
+
+        offset += 4 * 4;
+        ret.bc = asfloat(octree.Load4(offset));
+
+        offset += 4 * 4;
+        ret.edge_sum = asfloat(octree.Load3(offset));
+
+        return ret;
+    }
+
+    float4 solve_qef(octree_node_t node) {
+        uint n = node.child_mask >> 8;
+        float3 cent = rcp((float)n) * node.edge_sum;
+
+        float3x3 A = float3x3(
+            node.diagA.x, node.upperA.x, node.upperA.y,
+            node.upperA.x, node.diagA.y, node.upperA.z,
+            node.upperA.y, node.upperA.z, node.diagA.z
+        );
+        float3 b = node.bc.xyz;
+
+        float3 x = solve_linear(A, b, cent);
+
+        float residual = mul(x, mul(A, x)) - 2.0 * mul(x, b) + node.bc.w;
+        return float4(x, abs(residual));
+    }
+
+    #define OCTREE_AXIS_Z 0
+    #define OCTREE_AXIS_Y 1
+    #define OCTREE_AXIS_X 2
+
+    #define OCTREE_CHILD_IDX(x, y, z) (((x) << 2) | ((y) << 1) | (z))
+    #define OCTREE_CHILD_ID(parent_id, x, y, z) (((parent_id) << 3) + OCTREE_CHILD_IDX((x), (y), (z)) + 1)
+
+    void dual_contour_octree(ByteAddressBuffer collapsed_octree, uint root_id, RWByteAddressBuffer triangles, RWByteAddressBuffer index_counter) {
+        // x - id, y - node data (vertex_id 16 bit, edge signs 8 bit, child mask 8 bit)
+        uint2 cell[OCTREE_DEPTH + 2];
+        uint2 face[OCTREE_DEPTH + 2][2];
+        uint2 edge[OCTREE_DEPTH + 2][4];
+
+        // x - cell ctr, y - face ctr, z - edge ctr
+        uint3 cell_info[OCTREE_DEPTH + 2];
+
+        // x - axis, y - face ctr, z - edge ctr
+        uint3 face_info[OCTREE_DEPTH + 2];
+
+        // x - axis, y - edge ctr
+        uint4 edge_info[OCTREE_DEPTH + 2];
+
+        #define CHILD_OR_INVALID(ret, id_with_mask, cx, cy, cz) \
+            [branch] \
+            if ((id_with_mask).y & (1u << OCTREE_CHILD_IDX((cx), (cy), (cz)))) { \
+                uint child_id = ((id_with_mask).x << 3) + OCTREE_CHILD_IDX((cx), (cy), (cz)) + 1; \
+                ret = uint2(child_id, collapsed_octree.Load(child_id * 4)); \
+            } else { \
+                all_valid = 0; \
+            } \
+
+        #define LEAF_OR_CHILD(ret, mask_bit, mask_offset, id_with_mask, cx, cy, cz) \
+            [branch] \
+            if (id_with_mask.y & 0xFF) { \
+                CHILD_OR_INVALID(ret, id_with_mask, cx, cy, cz) \
+                minimal_cell = (mask_offset); \
+            } else { \
+                leaves += (mask_bit); \
+                leaf_mask |= (mask_bit) << (mask_offset); \
+                ret = (id_with_mask); \
+            } \
+
+        // TODO: can remove branches in these macros by utilizing leaf ctr
+        #define EDGE_PROC( \
+                mask_bit1, p1, p1x, p1y, p1z, \
+                mask_bit2, p2, p2x, p2y, p2z, \
+                mask_bit3, p3, p3x, p3y, p3z, \
+                mask_bit4, p4, p4x, p4y, p4z, \
+                init_leaf_mask, \
+                edge_axis) \
+            [branch] \
+            if (((p1).y | (p2).y | (p3).y | (p4).y) & 0xFF) { \
+                uint all_valid = 1; \
+                uint leaves = 0; \
+                uint leaf_mask = 0; \
+                uint minimal_cell = 0; \
+                LEAF_OR_CHILD(edge[ed + 1][0], mask_bit1, 0, p1, p1x, p1y, p1z); \
+                LEAF_OR_CHILD(edge[ed + 1][1], mask_bit2, 1, p2, p2x, p2y, p2z); \
+                LEAF_OR_CHILD(edge[ed + 1][2], mask_bit3, 2, p3, p3x, p3y, p3z); \
+                LEAF_OR_CHILD(edge[ed + 1][3], mask_bit4, 3, p4, p4x, p4y, p4z); \
+                edge_info[ed + 1] = uint4((edge_axis), 0, (init_leaf_mask) | leaf_mask, minimal_cell); \
+                ed += all_valid & (uint)step(leaves, 1); \
+            } \
+
+        #define FACE_PROC( \
+                p1, p1x, p1y, p1z, \
+                p2, p2x, p2y, p2z, \
+                face_axis) \
+            [branch] \
+            if (((p1).y | (p2).y) & 0xFF) { \
+                uint all_valid = 1; \
+                uint leaves = 0; \
+                uint leaf_mask = 0; \
+                uint minimal_cell = 0; \
+                LEAF_OR_CHILD(face[fd + 1][0], 0, 0, p1, p1x, p1y, p1z); \
+                LEAF_OR_CHILD(face[fd + 1][1], 0, 0, p2, p2x, p2y, p2z); \
+                face_info[fd + 1] = uint3((face_axis), 0, 0); \
+                fd += all_valid; \
+            } \
+
+        #define CELL_PROC(p1, p1x, p1y, p1z) \
+            { \
+                uint child_idx = OCTREE_CHILD_IDX((p1x), (p1y), (p1z)); \
+                [branch] \
+                if ((p1).y & (1u << child_idx)) { \
+                    uint child_id = ((p1).x << 3) + child_idx + 1; \
+                    ++cd; \
+                    cell[cd] = uint2(child_id, collapsed_octree.Load(child_id * 4)); \
+                    cell_info[cd] = uint3(0, 0, 0); \
+                } \
+            }
+
+        cell[1] = uint2(root_id, collapsed_octree.Load(root_id * 4));
+        cell_info[1] = uint3(0, 0, 0);
+        uint cd = 1;
+        uint fd = 0;
+        uint ed = 0;
+
+        // TODO: optimize loading
+        while (cd) {
+            [branch]
+            if (ed) {
+                [branch]
+                if (((edge[ed][0].y | edge[ed][1].y | edge[ed][2].y | edge[ed][3].y) & 0xFF) == 0) {
+                    uint minimal_cell = edge_info[ed].w;
+                    uint sign_position;
+                    [flatten]
+                    if (minimal_cell == 0) {
+                        sign_position = 7; // 1 1 1
+                    } else [flatten] if (minimal_cell == 1) {
+                        sign_position = edge_info[ed].x == OCTREE_AXIS_X ? 6 /* 1 1 0 */ : 3 /* 0 1 1 */;
+                    } else [flatten] if (minimal_cell == 2) {
+                        sign_position = edge_info[ed].x == OCTREE_AXIS_Y ? 6 /* 1 1 0 */ : 5 /* 1 0 1 */;
+                    } else {
+                        sign_position = 1u << edge_info[ed].x;
+                    }
+                    sign_position += 8;
+                    // either 0 or 2
+                    uint sign1 = (edge[ed][minimal_cell].y & (1u << sign_position)) >> (sign_position - 1);
+                    sign_position -= (1u << edge_info[ed].x);
+                    uint sign0 = (edge[ed][minimal_cell].y & (1u << sign_position)) >> sign_position;
+                    sign0 *= 2;
+                    [branch]
+                    if (sign0 != sign1) {
+                        uint v[4] = {
+                            (edge[ed][0].y & 0xFFFF0000) >> 16,
+                            (edge[ed][1].y & 0xFFFF0000) >> 16,
+                            (edge[ed][2].y & 0xFFFF0000) >> 16,
+                            (edge[ed][3].y & 0xFFFF0000) >> 16
+                        };
+                        // if one of the cubes is coarser than others,
+                        // need to generate a triangle instead of a quad
+                        [branch]
+                        if (edge_info[ed].z) {
+                            uint v3[4];
+                            uint i = 0;
+                            v3[i] = v[0];
+                            i += 1 - (edge_info[ed].z & 1);
+                            v3[i] = v[1];
+                            i += 1 - ((edge_info[ed].z & 2) >> 1);
+                            v3[i] = v[2];
+                            i += 1 - ((edge_info[ed].z & 4) >> 2);
+                            v3[i] = v[3];
+
+                            uint swap = edge_info[ed].z & 3 ? sign1 : 2u - sign1;
+                            swap = edge_info[ed].x == OCTREE_AXIS_Z ? 2u - swap : swap;
+                            uint indexes[3];
+                            indexes[0 + swap] = v3[0];
+                            indexes[1 + 0000] = v3[1];
+                            indexes[2 - swap] = v3[2];
+
+                            uint index_start;
+                            index_counter.InterlockedAdd(0, (uint)3, index_start);
+                            [branch]
+                            if (index_start % 6 == 0) {
+                                uint offset = index_start << 1;
+                                triangles.Store(offset, indexes[0] | (indexes[1] << 16));
+                                offset += 4;
+                                triangles.InterlockedOr(offset, indexes[2]);
+                            } else {
+                                uint offset = (index_start - 1) * 2;
+                                triangles.InterlockedOr(offset, indexes[0] << 16);
+                                offset += 4;
+                                triangles.Store(offset, indexes[1] | (indexes[2] << 16));
+                            }
+                        } else {
+                            uint indexes[6];
+                            // TODO: debranch
+                            [branch]
+                            if (edge_info[ed].x == OCTREE_AXIS_Y) {
+                                uint swap = 2u - sign1;
+                                indexes[0 + swap] = v[0];
+                                indexes[1 + 0000] = v[1];
+                                indexes[2 - swap] = v[2];
+
+                                indexes[3 + swap] = v[2];
+                                indexes[4 + 0000] = v[1];
+                                indexes[5 - swap] = v[3];
+                            } else [branch] if (edge_info[ed].x == OCTREE_AXIS_Z) {
+                                uint swap = sign1;
+                                indexes[0 + swap] = v[0];
+                                indexes[1 + 0000] = v[1];
+                                indexes[2 - swap] = v[2];
+
+                                indexes[3 + swap] = v[2];
+                                indexes[4 + 0000] = v[1];
+                                indexes[5 - swap] = v[3];
+                            } else { // X
+                                uint swap = sign1;
+                                indexes[0 + swap] = v[0];
+                                indexes[1 + 0000] = v[2];
+                                indexes[2 - swap] = v[1];
+
+                                indexes[3 + swap] = v[2];
+                                indexes[4 + 0000] = v[3];
+                                indexes[5 - swap] = v[1];
+                            }
+
+                            uint index_start;
+                            index_counter.InterlockedAdd(0, (uint)6, index_start);
+                            [branch]
+                            if (index_start % 6 == 0) {
+                                uint3 index_data = uint3(
+                                    (indexes[0]) | (indexes[1] << 16),
+                                    (indexes[2]) | (indexes[3] << 16),
+                                    (indexes[4]) | (indexes[5] << 16)
+                                );
+                                triangles.Store3(index_start << 1, index_data);
+                            } else {
+                                uint offset = (index_start - 1) * 2;
+                                triangles.InterlockedOr(offset, indexes[0] << 16);
+                                offset += 4;
+                                triangles.Store2(offset, uint2(
+                                    (indexes[1]) | (indexes[2] << 16),
+                                    (indexes[3]) | (indexes[4] << 16)
+                                ));
+                                offset += 8;
+                                triangles.InterlockedOr(offset, indexes[5]);
+                            }
+                        }
+                    }
+                    --ed;
+                } else [branch] if (edge_info[ed].y == 2) {
+                    --ed;
+                } else [branch] if (edge_info[ed].x == OCTREE_AXIS_X) {
+                    ++edge_info[ed].y;
+                    [branch]
+                    if (edge_info[ed].y == 1) {
+                        EDGE_PROC(
+                            0, edge[ed][0], 0, 1, 1,
+                            0, edge[ed][1], 0, 1, 0,
+                            0, edge[ed][2], 0, 0, 1,
+                            0, edge[ed][3], 0, 0, 0,
+                            edge_info[ed].z,
+                            OCTREE_AXIS_X
+                        );
+                    } else {
+                        EDGE_PROC(
+                            0, edge[ed][0], 1, 1, 1,
+                            0, edge[ed][1], 1, 1, 0,
+                            0, edge[ed][2], 1, 0, 1,
+                            0, edge[ed][3], 1, 0, 0,
+                            edge_info[ed].z,
+                            OCTREE_AXIS_X
+                        );
+                    }
+                } else [branch] if (edge_info[ed].x == OCTREE_AXIS_Y) {
+                    ++edge_info[ed].y;
+                    [branch]
+                    if (edge_info[ed].y == 1) {
+                        EDGE_PROC(
+                            0, edge[ed][0], 1, 0, 1,
+                            0, edge[ed][1], 0, 0, 1,
+                            0, edge[ed][2], 1, 0, 0,
+                            0, edge[ed][3], 0, 0, 0,
+                            edge_info[ed].z,
+                            OCTREE_AXIS_Y
+                        );
+                    } else {
+                        EDGE_PROC(
+                            0, edge[ed][0], 1, 1, 1,
+                            0, edge[ed][1], 0, 1, 1,
+                            0, edge[ed][2], 1, 1, 0,
+                            0, edge[ed][3], 0, 1, 0,
+                            edge_info[ed].z,
+                            OCTREE_AXIS_Y
+                        );
+                    }
+                } else { // fixed-z
+                    ++edge_info[ed].y;
+                    [branch]
+                    if (edge_info[ed].y == 1) {
+                        EDGE_PROC(
+                            0, edge[ed][0], 1, 1, 0,
+                            0, edge[ed][1], 0, 1, 0,
+                            0, edge[ed][2], 1, 0, 0,
+                            0, edge[ed][3], 0, 0, 0,
+                            edge_info[ed].z,
+                            OCTREE_AXIS_Z
+                        );
+                    } else {
+                        EDGE_PROC(
+                            0, edge[ed][0], 1, 1, 1,
+                            0, edge[ed][1], 0, 1, 1,
+                            0, edge[ed][2], 1, 0, 1,
+                            0, edge[ed][3], 0, 0, 1,
+                            edge_info[ed].z,
+                            OCTREE_AXIS_Z
+                        );
+                    }
+                }
+            } else [branch] if (fd) {
+                [branch]
+                if (face_info[fd].y < 4) {
+                    ++face_info[fd].y;
+                    [branch]
+                    if (face_info[fd].x == OCTREE_AXIS_X) {
+                        [branch] switch (face_info[fd].y) {
+                            case 1:
+                                FACE_PROC(
+                                    face[fd][0], 1, 0, 0,
+                                    face[fd][1], 0, 0, 0,
+                                    OCTREE_AXIS_X
+                                );
+                                break;
+                            case 2:
+                                FACE_PROC(
+                                    face[fd][0], 1, 0, 1,
+                                    face[fd][1], 0, 0, 1,
+                                    OCTREE_AXIS_X
+                                );
+                                break;
+                            case 3:
+                                FACE_PROC(
+                                    face[fd][0], 1, 1, 0,
+                                    face[fd][1], 0, 1, 0,
+                                    OCTREE_AXIS_X
+                                );
+                                break;
+                            default:
+                                FACE_PROC(
+                                    face[fd][0], 1, 1, 1,
+                                    face[fd][1], 0, 1, 1,
+                                    OCTREE_AXIS_X
+                                );
+                                break;
+                        }
+                    } else [branch] if (face_info[fd].x == OCTREE_AXIS_Y) {
+                        [branch] switch (face_info[fd].y) {
+                            case 1:
+                                FACE_PROC(
+                                    face[fd][0], 0, 1, 0,
+                                    face[fd][1], 0, 0, 0,
+                                    OCTREE_AXIS_Y
+                                );
+                                break;
+                            case 2:
+                                FACE_PROC(
+                                    face[fd][0], 0, 1, 1,
+                                    face[fd][1], 0, 0, 1,
+                                    OCTREE_AXIS_Y
+                                );
+                                break;
+                            case 3:
+                                FACE_PROC(
+                                    face[fd][0], 1, 1, 0,
+                                    face[fd][1], 1, 0, 0,
+                                    OCTREE_AXIS_Y
+                                );
+                                break;
+                            default:
+                                FACE_PROC(
+                                    face[fd][0], 1, 1, 1,
+                                    face[fd][1], 1, 0, 1,
+                                    OCTREE_AXIS_Y
+                                );
+                                break;
+                        }
+                    } else { // Z
+                        [branch] switch (face_info[fd].y) {
+                            case 1:
+                                FACE_PROC(
+                                    face[fd][0], 0, 0, 1,
+                                    face[fd][1], 0, 0, 0,
+                                    OCTREE_AXIS_Z
+                                );
+                                break;
+                            case 2:
+                                FACE_PROC(
+                                    face[fd][0], 0, 1, 1,
+                                    face[fd][1], 0, 1, 0,
+                                    OCTREE_AXIS_Z
+                                );
+                                break;
+                            case 3:
+                                FACE_PROC(
+                                    face[fd][0], 1, 0, 1,
+                                    face[fd][1], 1, 0, 0,
+                                    OCTREE_AXIS_Z
+                                );
+                                break;
+                            default:
+                                FACE_PROC(
+                                    face[fd][0], 1, 1, 1,
+                                    face[fd][1], 1, 1, 0,
+                                    OCTREE_AXIS_Z
+                                );
+                                break;
+                        }
+                    }
+                } else [branch] if (face_info[fd].z < 4) {
+                    ++face_info[fd].z;
+                    [branch]
+                    if (face_info[fd].x == OCTREE_AXIS_X) {
+                        [branch] switch (face_info[fd].z) {
+                            case 1:
+                                EDGE_PROC(
+                                    0, face[fd][0], 1, 0, 0,
+                                    0, face[fd][1], 0, 0, 0,
+                                    1, face[fd][0], 1, 0, 1,
+                                    1, face[fd][1], 0, 0, 1,
+                                    0,
+                                    OCTREE_AXIS_Y
+                                );
+                                break;
+                            case 2:
+                                EDGE_PROC(
+                                    0, face[fd][0], 1, 1, 0,
+                                    0, face[fd][1], 0, 1, 0,
+                                    1, face[fd][0], 1, 1, 1,
+                                    1, face[fd][1], 0, 1, 1,
+                                    0,
+                                    OCTREE_AXIS_Y
+                                );
+                                break;
+                            case 3:
+                                EDGE_PROC(
+                                    0, face[fd][0], 1, 0, 0,
+                                    0, face[fd][1], 0, 0, 0,
+                                    1, face[fd][0], 1, 1, 0,
+                                    1, face[fd][1], 0, 1, 0,
+                                    0,
+                                    OCTREE_AXIS_Z
+                                );
+                                break;
+                            default:
+                                EDGE_PROC(
+                                    0, face[fd][0], 1, 0, 1,
+                                    0, face[fd][1], 0, 0, 1,
+                                    1, face[fd][0], 1, 1, 1,
+                                    1, face[fd][1], 0, 1, 1,
+                                    0,
+                                    OCTREE_AXIS_Z
+                                );
+                                break;
+                        }
+                    } else [branch] if (face_info[fd].x == OCTREE_AXIS_Y) {
+                        [branch] switch (face_info[fd].z) {
+                            case 1:
+                                EDGE_PROC(
+                                    0, face[fd][0], 0, 1, 0,
+                                    1, face[fd][0], 0, 1, 1,
+                                    0, face[fd][1], 0, 0, 0,
+                                    1, face[fd][1], 0, 0, 1,
+                                    0,
+                                    OCTREE_AXIS_X
+                                );
+                                break;
+                            case 2:
+                                EDGE_PROC(
+                                    0, face[fd][0], 1, 1, 0,
+                                    1, face[fd][0], 1, 1, 1,
+                                    0, face[fd][1], 1, 0, 0,
+                                    1, face[fd][1], 1, 0, 1,
+                                    0,
+                                    OCTREE_AXIS_X
+                                );
+                                break;
+                            case 3:
+                                EDGE_PROC(
+                                    0, face[fd][0], 0, 1, 0,
+                                    1, face[fd][0], 1, 1, 0,
+                                    0, face[fd][1], 0, 0, 0,
+                                    1, face[fd][1], 1, 0, 0,
+                                    0,
+                                    OCTREE_AXIS_Z
+                                );
+                                break;
+                            default:
+                                EDGE_PROC(
+                                    0, face[fd][0], 0, 1, 1,
+                                    1, face[fd][0], 1, 1, 1,
+                                    0, face[fd][1], 0, 0, 1,
+                                    1, face[fd][1], 1, 0, 1,
+                                    0,
+                                    OCTREE_AXIS_Z
+                                );
+                                break;
+                        }
+                    } else { // Z
+                        [branch] switch (face_info[fd].z) {
+                            case 1:
+                                EDGE_PROC(
+                                    0, face[fd][0], 0, 0, 1,
+                                    0, face[fd][1], 0, 0, 0,
+                                    1, face[fd][0], 0, 1, 1,
+                                    1, face[fd][1], 0, 1, 0,
+                                    0,
+                                    OCTREE_AXIS_X
+                                );
+                                break;
+                            case 2:
+                                EDGE_PROC(
+                                    0, face[fd][0], 1, 0, 1,
+                                    0, face[fd][1], 1, 0, 0,
+                                    1, face[fd][0], 1, 1, 1,
+                                    1, face[fd][1], 1, 1, 0,
+                                    0,
+                                    OCTREE_AXIS_X
+                                );
+                                break;
+                            case 3:
+                                EDGE_PROC(
+                                    0, face[fd][0], 0, 0, 1,
+                                    1, face[fd][0], 1, 0, 1,
+                                    0, face[fd][1], 0, 0, 0,
+                                    1, face[fd][1], 1, 0, 0,
+                                    0,
+                                    OCTREE_AXIS_Y
+                                );
+                                break;
+                            default:
+                                EDGE_PROC(
+                                    0, face[fd][0], 0, 1, 1,
+                                    1, face[fd][0], 1, 1, 1,
+                                    0, face[fd][1], 0, 1, 0,
+                                    1, face[fd][1], 1, 1, 0,
+                                    0,
+                                    OCTREE_AXIS_Y
+                                );
+                                break;
+                        }
+                    }
+                } else {
+                    --fd;
+                }
+            } else { // cell proc
+                // 8 child cells
+                [branch]
+                if (cell_info[cd].x < 8) {
+                    ++cell_info[cd].x;
+                    [branch] switch (cell_info[cd].x) {
+                        case 1:
+                            CELL_PROC(cell[cd], 0, 0, 0);
+                            break;
+                        case 2:
+                            CELL_PROC(cell[cd], 0, 0, 1);
+                            break;
+                        case 3:
+                            CELL_PROC(cell[cd], 0, 1, 0);
+                            break;
+                        case 4:
+                            CELL_PROC(cell[cd], 0, 1, 1);
+                            break;
+                        case 5:
+                            CELL_PROC(cell[cd], 1, 0, 0);
+                            break;
+                        case 6:
+                            CELL_PROC(cell[cd], 1, 0, 1);
+                            break;
+                        case 7:
+                            CELL_PROC(cell[cd], 1, 1, 0);
+                            break;
+                        default:
+                            CELL_PROC(cell[cd], 1, 1, 1);
+                            break;
+                    }
+                // 4 face-sharing pairs per axis
+                } else [branch] if (cell_info[cd].y < 12) {
+                    ++cell_info[cd].y;
+                    [branch] switch (cell_info[cd].y) {
+                        case 1:
+                            FACE_PROC(
+                                cell[cd], 0, 0, 0,
+                                cell[cd], 0, 1, 0,
+                                OCTREE_AXIS_Y
+                            );
+                            break;
+                        case 2:
+                            FACE_PROC(
+                                cell[cd], 0, 0, 1,
+                                cell[cd], 0, 1, 1,
+                                OCTREE_AXIS_Y
+                            );
+                            break;
+                        case 3:
+                            FACE_PROC(
+                                cell[cd], 1, 0, 0,
+                                cell[cd], 1, 1, 0,
+                                OCTREE_AXIS_Y
+                            );
+                            break;
+                        case 4:
+                            FACE_PROC(
+                                cell[cd], 1, 0, 1,
+                                cell[cd], 1, 1, 1,
+                                OCTREE_AXIS_Y
+                            );
+                            break;
+                        case 5:
+                            FACE_PROC(
+                                cell[cd], 0, 0, 0,
+                                cell[cd], 1, 0, 0,
+                                OCTREE_AXIS_X
+                            );
+                            break;
+                        case 6:
+                            FACE_PROC(
+                                cell[cd], 0, 0, 1,
+                                cell[cd], 1, 0, 1,
+                                OCTREE_AXIS_X
+                            );
+                            break;
+                        case 7:
+                            FACE_PROC(
+                                cell[cd], 0, 1, 0,
+                                cell[cd], 1, 1, 0,
+                                OCTREE_AXIS_X
+                            );
+                            break;
+                        case 8:
+                            FACE_PROC(
+                                cell[cd], 0, 1, 1,
+                                cell[cd], 1, 1, 1,
+                                OCTREE_AXIS_X
+                            );
+                            break;
+                        case 9:
+                            FACE_PROC(
+                                cell[cd], 0, 0, 0,
+                                cell[cd], 0, 0, 1,
+                                OCTREE_AXIS_Z
+                            );
+                            break;
+                        case 10:
+                            FACE_PROC(
+                                cell[cd], 0, 1, 0,
+                                cell[cd], 0, 1, 1,
+                                OCTREE_AXIS_Z
+                            );
+                            break;
+                        case 11:
+                            FACE_PROC(
+                                cell[cd], 1, 0, 0,
+                                cell[cd], 1, 0, 1,
+                                OCTREE_AXIS_Z
+                            );
+                            break;
+                        default:
+                            FACE_PROC(
+                                cell[cd], 1, 1, 0,
+                                cell[cd], 1, 1, 1,
+                                OCTREE_AXIS_Z
+                            );
+                            break;
+                    }
+                // 2 edge-sharing quartets per axis
+                } else [branch] if (cell_info[cd].z < 6) {
+                    ++cell_info[cd].z;
+                    [branch] switch (cell_info[cd].z) {
+                        case 1:
+                            EDGE_PROC(
+                                0, cell[cd], 0, 0, 0,
+                                0, cell[cd], 1, 0, 0,
+                                0, cell[cd], 0, 0, 1,
+                                0, cell[cd], 1, 0, 1,
+                                0,
+                                OCTREE_AXIS_Y
+                            );
+                            break;
+                        case 2:
+                            EDGE_PROC(
+                                0, cell[cd], 0, 1, 0,
+                                0, cell[cd], 1, 1, 0,
+                                0, cell[cd], 0, 1, 1,
+                                0, cell[cd], 1, 1, 1,
+                                0,
+                                OCTREE_AXIS_Y
+                            );
+                            break;
+                        case 3:
+                            EDGE_PROC(
+                                0, cell[cd], 0, 0, 0,
+                                0, cell[cd], 0, 0, 1,
+                                0, cell[cd], 0, 1, 0,
+                                0, cell[cd], 0, 1, 1,
+                                0,
+                                OCTREE_AXIS_X
+                            );
+                            break;
+                        case 4:
+                            EDGE_PROC(
+                                0, cell[cd], 1, 0, 0,
+                                0, cell[cd], 1, 0, 1,
+                                0, cell[cd], 1, 1, 0,
+                                0, cell[cd], 1, 1, 1,
+                                0,
+                                OCTREE_AXIS_X
+                            );
+                            break;
+                        case 5:
+                            EDGE_PROC(
+                                0, cell[cd], 0, 0, 0,
+                                0, cell[cd], 1, 0, 0,
+                                0, cell[cd], 0, 1, 0,
+                                0, cell[cd], 1, 1, 0,
+                                0,
+                                OCTREE_AXIS_Z
+                            );
+                            break;
+                        default:
+                            EDGE_PROC(
+                                0, cell[cd], 0, 0, 1,
+                                0, cell[cd], 1, 0, 1,
+                                0, cell[cd], 0, 1, 1,
+                                0, cell[cd], 1, 1, 1,
+                                0,
+                                OCTREE_AXIS_Z
+                            );
+                            break;
+                    }
+                } else {
+                    --cd;
+                }
+            }
+        }
+    }
+
+    void get_node_start_end(uint node_id, out uint3 start, out uint3 end) {
+        uint3 bits[OCTREE_DEPTH + 1];
+        uint depth = 0;
+        while (node_id) {
+            node_id -= 1;
+            bits[depth] = uint3((node_id & 4) >> 2, (node_id & 2) >> 1, node_id & 1);
+            node_id >>= 3;
+            ++depth;
+        }
+
+        start = 0;
+        end = REGION_SIZE;
+        uint3 size = end;
+        for (uint i = depth; i > 0; --i) {
+            size >>= 1;
+            start += size * bits[i - 1];
+            end -= size * (1 - bits[i - 1]);
+        }
+    }
+
+    // Returns true if collapsing would be topologically safe.
+    bool can_collapse(uint signs, uint child_signs[8], uint depth) {
+        [branch]
+        if (load_is_critical_cube(signs)) {
+            return false;
+        }
+
+        [branch]
+        if (depth == OCTREE_DEPTH) {
+            uint any_child_critical = 0
+                | load_is_critical_cube(child_signs[0])
+                | load_is_critical_cube(child_signs[1])
+                | load_is_critical_cube(child_signs[2])
+                | load_is_critical_cube(child_signs[3])
+                | load_is_critical_cube(child_signs[4])
+                | load_is_critical_cube(child_signs[5])
+                | load_is_critical_cube(child_signs[6])
+                | load_is_critical_cube(child_signs[7])
+                ;
+            if (any_child_critical)
+                return false;
+        }
+
+        #define EDGE_CHECK( \
+                e1x, e1y, e1z, \
+                e2x, e2y, e2z \
+                ) \
+            { \
+                uint e1 = (e1x << 2) | (e1y << 1) | e1z; \
+                uint e2 = (e2x << 2) | (e2y << 1) | e2z; \
+                uint s1 = (signs & (1u << e1)) >> e1; \
+                uint s2 = (signs & (1u << e2)) >> e2; \
+                uint c = (child_signs[e1] & (1u << e2)) >> e2; \
+                if (s1 != c && s2 != c) \
+                    return false; \
+            }
+
+        #define FACE_CHECK( \
+                v1x, v1y, v1z, \
+                v2x, v2y, v2z, \
+                v3x, v3y, v3z, \
+                v4x, v4y, v4z \
+                ) \
+            { \
+                uint v1 = (v1x << 2) | (v1y << 1) | v1z; \
+                uint v2 = (v2x << 2) | (v2y << 1) | v2z; \
+                uint v3 = (v3x << 2) | (v3y << 1) | v3z; \
+                uint v4 = (v4x << 2) | (v4y << 1) | v4z; \
+                uint s1 = (signs & (1u << v1)) >> v1; \
+                uint s2 = (signs & (1u << v2)) >> v2; \
+                uint s3 = (signs & (1u << v3)) >> v3; \
+                uint s4 = (signs & (1u << v4)) >> v4; \
+                uint c = (child_signs[v1] & (1u << v4)) >> v4; \
+                if (s1 != c && s2 != c && s3 != c && s4 != c) \
+                    return false; \
+            }
+
+        EDGE_CHECK(
+            0u, 0u, 0u,
+            0u, 0u, 1u
+        );
+        EDGE_CHECK(
+            0u, 1u, 0u,
+            0u, 1u, 1u
+        );
+        EDGE_CHECK(
+            1u, 0u, 0u,
+            1u, 0u, 1u
+        );
+        EDGE_CHECK(
+            1u, 1u, 0u,
+            1u, 1u, 1u
+        );
+
+        EDGE_CHECK(
+            0u, 0u, 0u,
+            0u, 1u, 0u
+        );
+        EDGE_CHECK(
+            0u, 0u, 1u,
+            0u, 1u, 1u
+        );
+        EDGE_CHECK(
+            1u, 0u, 0u,
+            1u, 1u, 0u
+        );
+        EDGE_CHECK(
+            1u, 0u, 1u,
+            1u, 1u, 1u
+        );
+
+        EDGE_CHECK(
+            0u, 0u, 0u,
+            1u, 0u, 0u
+        );
+        EDGE_CHECK(
+            0u, 0u, 1u,
+            1u, 0u, 1u
+        );
+        EDGE_CHECK(
+            0u, 1u, 0u,
+            1u, 1u, 0u
+        );
+        EDGE_CHECK(
+            0u, 1u, 1u,
+            1u, 1u, 1u
+        );
+
+        FACE_CHECK(
+            0u, 0u, 0u,
+            1u, 0u, 0u,
+            0u, 1u, 0u,
+            1u, 1u, 0u
+        );
+        FACE_CHECK(
+            0u, 0u, 1u,
+            1u, 0u, 1u,
+            0u, 1u, 1u,
+            1u, 1u, 1u
+        );
+        FACE_CHECK(
+            0u, 0u, 0u,
+            0u, 0u, 1u,
+            0u, 1u, 0u,
+            0u, 1u, 1u
+        );
+        FACE_CHECK(
+            1u, 0u, 0u,
+            1u, 0u, 1u,
+            1u, 1u, 0u,
+            1u, 1u, 1u
+        );
+        FACE_CHECK(
+            0u, 0u, 0u,
+            0u, 0u, 1u,
+            1u, 0u, 0u,
+            1u, 0u, 1u
+        );
+        FACE_CHECK(
+            0u, 1u, 0u,
+            0u, 1u, 1u,
+            1u, 1u, 0u,
+            1u, 1u, 1u
+        );
+
+        uint middle = child_signs[7] & 1u;
+        if ((signs == 0u && (middle != 0u)) || (signs == 255u && (middle != 1u)))
+            return false;
+
+        return true;
+    }
+
+    void try_collapse(ByteAddressBuffer octree, uint root_id, float tolerance, ByteAddressBuffer densities, RWByteAddressBuffer collapsed_octree, RWByteAddressBuffer vertices) {
+        // x - index of the current child
+        // y - id
+        // z - number of leaf children
+        // w - total number of children
+        uint4 node_info[OCTREE_DEPTH + 2];
+        uint child_signs[OCTREE_DEPTH + 2][8];
+        octree_node_t nodes[OCTREE_DEPTH + 2];
+
+        nodes[1] = load_node(octree, root_id);
+        node_info[1] = uint4(0, root_id, 0, 0);
+        uint cur_depth = 1;
+        while (cur_depth) {
+            [branch]
+            if (node_info[cur_depth].x == 8) {
+                // if all children are leaves, try collapsing
+                // TODO: optimize if this ends up working
+                // TODO: this can actually be computed from child signs
+                #define LOAD_CORNER_DENSITY(corner) (load_density(densities, start * (uint3(1, 1, 1) - corner) + end * corner).w)
+                #define LOAD_SIGN_MASK() \
+                    uint3 start, end; \
+                    get_node_start_end(node_info[cur_depth].y, start, end); \
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 0)), 0)) << 0; \
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 1)), 0)) << 1; \
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 0)), 0)) << 2; \
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 1)), 0)) << 3; \
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 0)), 0)) << 4; \
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 1)), 0)) << 5; \
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 0)), 0)) << 6; \
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 1)), 0)) << 7;
+                //#define LOAD_CORNER_DENSITY(corner) (v[corner.x][corner.y][corner.z].w)
+
+                float3 vertex;
+                uint child_mask = nodes[cur_depth].child_mask & 0xFF;
+                bool is_leaf = false;
+                // TODO: can reduce branching here
+                uint sign_mask = 0;
+                [branch]
+                if (node_info[cur_depth].w && node_info[cur_depth].z == node_info[cur_depth].w) {
+                    uint3 start, end;
+                    get_node_start_end(node_info[cur_depth].y, start, end);
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 0)), 0.0)) << 0;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 1)), 0.0)) << 1;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 0)), 0.0)) << 2;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 1)), 0.0)) << 3;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 0)), 0.0)) << 4;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 1)), 0.0)) << 5;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 0)), 0.0)) << 6;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 1)), 0.0)) << 7;
+
+                    for (uint i = 0; i < 8; ++i) {
+                        [branch]
+                        if ((child_mask & (1u << i)) == 0) {
+                            child_signs[cur_depth][i] = sign_mask & (1u << i) ? 255 : 0;
+                        }
+                    }
+
+                    [branch]
+                    if (can_collapse(sign_mask, child_signs[cur_depth], cur_depth)) {
+                        float4 qef_result = solve_qef(nodes[cur_depth]);
+                        vertex = qef_result.xyz;
+                        [branch]
+                        if (qef_result.w < tolerance) {
+                            child_mask = 0;
+                            is_leaf = true;
+                        }
+                    }
+                } else [branch] if (!node_info[cur_depth].w) {
+                    uint3 start, end;
+                    get_node_start_end(node_info[cur_depth].y, start, end);
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 0)), 0)) << 0;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 1)), 0)) << 1;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 0)), 0)) << 2;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 1)), 0)) << 3;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 0)), 0)) << 4;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 1)), 0)) << 5;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 0)), 0)) << 6;
+                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 1)), 0)) << 7;
+                    is_leaf = true;
+                    vertex = solve_qef(nodes[cur_depth]).xyz;
+                }
+
+                [branch]
+                if (is_leaf) {
+                    float4 v[2][2][2];
+                    load_cell_densities(densities, (uint3)trunc(clamp(vertex, float3(0, 0, 0), float3(REGION_SIZE, REGION_SIZE, REGION_SIZE))), v);
+
+                    child_mask |= nodes[cur_depth].vertex_id << 16;
+                    child_mask |= sign_mask << 8;
+
+                    float3 wp = vertex - float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN);
+                    float3 wn = normalize(trilerp(v, frac(vertex)));
+                    uint3 vertex_data = uint3(
+                        f32tof16(wp.x) | (f32tof16(wp.y) << 16),
+                        f32tof16(wp.z) | (f32tof16(wn.x) << 16),
+                        f32tof16(wn.y) | (f32tof16(wn.z) << 16)
+                    );
+                    vertices.Store3(nodes[cur_depth].vertex_id * 12, vertex_data);
+
+                    // if leaf, increment parent's leaf counter and add QEF values
+                    ++node_info[cur_depth - 1].z;
+                    nodes[cur_depth - 1].bc += nodes[cur_depth].bc;
+                    nodes[cur_depth - 1].diagA += nodes[cur_depth].diagA;
+                    nodes[cur_depth - 1].upperA += nodes[cur_depth].upperA;
+                    nodes[cur_depth - 1].edge_sum += nodes[cur_depth].edge_sum;
+                    nodes[cur_depth - 1].vertex_id = nodes[cur_depth].vertex_id;
+                    child_signs[cur_depth - 1][node_info[cur_depth - 1].x - 1] = sign_mask;
+                    // add active edge count
+                    // TODO: can simply add
+                    nodes[cur_depth - 1].child_mask = (nodes[cur_depth - 1].child_mask & 0xFF) | (((nodes[cur_depth - 1].child_mask >> 8) + (nodes[cur_depth].child_mask >> 8)) << 8);
+                }
+
+                collapsed_octree.Store(node_info[cur_depth].y * 4, child_mask);
+                --cur_depth;
+             } else [branch] if (nodes[cur_depth].child_mask & (1u << node_info[cur_depth].x)) {
+                ++node_info[cur_depth].w;
+                ++node_info[cur_depth].x;
+                uint child_id = node_info[cur_depth].y * 8 + node_info[cur_depth].x;
+                nodes[cur_depth + 1] = load_node(octree, child_id);
+                node_info[cur_depth + 1] = uint4(
+                    0,
+                    child_id,
+                    0,
+                    0
+                );
+                ++cur_depth;
+            } else {
+                ++node_info[cur_depth].x;
+            }
+        }
+    }
+
+]]
+
+system : {
+    includes: [ "magnum_common", "magnum_linalg" ]
+}

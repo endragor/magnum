@@ -9,122 +9,10 @@ imports: [
 ]
 
 compile: {
-    includes: [ "magnum_common" ]
+    includes: [ "magnum_common", "magnum_linalg" ]
 }
 
 common: [[
-
-    #define ROTATE(a1, a2) \
-        g = a1; \
-        h = a2; \
-        a1 = g - s * (h + g * tau); \
-        a2 = h + s * (g - h * tau); \
-
-    #define ELEMENT_ITERATION(elem, d1, d2, z1, z2, rotations) \
-        g = 100.0 * abs(elem); \
-        if (i > 4 && (abs(d1) + g) == abs(d1) && (abs(d2) + g) == abs(d2)) { \
-            elem = 0.0; \
-        } else if (abs(elem) > tresh) { \
-            float h = d2 - d1; \
-            float t; \
-            if ((abs(h) + g) == abs(h)) { \
-                t = elem / h; \
-            } else { \
-                float theta = 0.5 * h / elem; \
-                t = 1.0 / (abs(theta) + sqrt(1.0 + theta * theta));  \
-                t *= step(0.0, theta) * 2.0 - 1.0; \
-            } \
-            float c = 1.0 / sqrt(1.0 + t * t); \
-            float s = t * c; \
-            float tau = s / (1.0 + c); \
-            h = t * elem; \
-            z1 -= h; \
-            z2 += h; \
-            d1 -= h; \
-            d2 += h; \
-            elem = 0.0; \
-            rotations \
-        } \
-
-
-    void eigen_decompose(float3x3 A, out float3x3 V, out float3x3 E) {
-        // Explanation in Numerical Recipies in C, Second Edition, page 463
-        // https://www.cec.uchile.cl/cinetica/pcordero/MC_libros/NumericalRecipesinC.pdf
-
-        V = float3x3(
-             1, 0, 0 ,
-             0, 1, 0 ,
-             0, 0, 1
-        );
-
-        float3 b = float3(A._11, A._22, A._33);
-        float3 d = b;
-        float3 z = 0;
-
-        float g;
-        for (uint i = 1; i <= 50; ++i) {
-            float sm = abs(A._12) + abs(A._13) + abs(A._23);
-            if (sm == 0.0)
-                break;
-
-            float tresh;
-            if (i < 4)
-                tresh = 0.2 * sm / 9.0;
-            else
-                tresh = 0.0;
-
-            ELEMENT_ITERATION(A._12, d.x, d.y, z.x, z.y, {
-                ROTATE(A._13, A._23);
-
-                ROTATE(V._11, V._12);
-                ROTATE(V._21, V._22);
-                ROTATE(V._31, V._32);
-            });
-
-            ELEMENT_ITERATION(A._13, d.x, d.z, z.x, z.z, {
-                ROTATE(A._12, A._23);
-
-                ROTATE(V._11, V._13);
-                ROTATE(V._21, V._23);
-                ROTATE(V._31, V._33);
-            });
-
-            ELEMENT_ITERATION(A._23, d.y, d.z, z.y, z.z, {
-                ROTATE(A._12, A._13);
-
-                ROTATE(V._12, V._13);
-                ROTATE(V._22, V._23);
-                ROTATE(V._32, V._33);
-            });
-
-            b += z;
-            d = b;
-            z = 0;
-        }
-
-        E = float3x3(
-             d.x, 0, 0 ,
-             0, d.y, 0 ,
-             0, 0, d.z
-        );
-    }
-
-
-    float3 solve_linear(float3x3 A, float3 b, float3 mid) {
-        float3x3 V;
-        float3x3 E;
-        eigen_decompose(A, V, E);
-
-        float max_val = max(max(abs(E._11), abs(E._22)), abs(E._33));
-        float tresh = 0.1;
-
-        E._11 = rcp(abs(E._11)) * step(tresh, abs(E._11) / max_val);
-        E._22 = rcp(abs(E._22)) * step(tresh, abs(E._22) / max_val);
-        E._33 = rcp(abs(E._33)) * step(tresh, abs(E._33) / max_val);
-
-        return mid + mul(mul(mul(V, E), transpose(V)), b - mul(A, mid));
-    }
-
     float3 min_qef(float3 p[12], float3 n[12], uint count) {
         float3x3 A = 0;
         float3 b = 0;
@@ -150,6 +38,7 @@ common: [[
             c += p[ip] * one_to_n;
         }
 
+        //return float3(0.5, 0.5, 0.5);
         //return saturate(c);
         return solve_linear(A, b, (c));
     }
@@ -212,7 +101,7 @@ compute_shader: {
     import_system_semantics: [ "dispatch_thread_id" ]
 
     attributes: {
-        num_threads: [35, 1, 1]
+        num_threads: [32, 1, 1]
     }
 
     code: [[
@@ -252,7 +141,7 @@ compute_shader: {
                         ++change_idx;
 
                         [branch]
-                        if ((1 - dx) & (1 - dy) & cellout.x && cellout.y) {
+                        if ((1 - dx) & (1 - dy) & cellout.x & cellout.y) {
                             uint swap = (uint)(1 - solid0) * 2;
                             uint ltriangles[6];
 
@@ -303,9 +192,9 @@ compute_shader: {
                             ltriangles[1 + 0000] = flat_offset(cell.x - 0, cell.y, cell.z - 1);
                             ltriangles[2 - swap] = flat_offset(cell.x - 1, cell.y, cell.z - 0);
 
-                            ltriangles[5 - swap] = flat_offset(cell.x - 1, cell.y, cell.z - 0);
-                            ltriangles[4 + 0000] = flat_offset(cell.x - 0, cell.y, cell.z - 0);
                             ltriangles[3 + swap] = flat_offset(cell.x - 0, cell.y, cell.z - 1);
+                            ltriangles[4 + 0000] = flat_offset(cell.x - 0, cell.y, cell.z - 0);
+                            ltriangles[5 - swap] = flat_offset(cell.x - 1, cell.y, cell.z - 0);
 
                             uint index_start;
                             region_indirect.InterlockedAdd(0, (uint)6, index_start);
@@ -341,13 +230,13 @@ compute_shader: {
                         if ((1 - dy) & (1 - dz) & cellout.y & cellout.z) {
                             uint swap = (uint)(1 - solid0) * 2;
                             uint ltriangles[6];
-                            ltriangles[2 - swap] = flat_offset(cell.x, cell.y - 1, cell.z - 0);
-                            ltriangles[1 + 0000] = flat_offset(cell.x, cell.y - 0, cell.z - 1);
                             ltriangles[0 + swap] = flat_offset(cell.x, cell.y - 1, cell.z - 1);
+                            ltriangles[1 + 0000] = flat_offset(cell.x, cell.y - 0, cell.z - 1);
+                            ltriangles[2 - swap] = flat_offset(cell.x, cell.y - 1, cell.z - 0);
 
-                            ltriangles[5 - swap] = flat_offset(cell.x, cell.y - 1, cell.z - 0);
-                            ltriangles[4 + 0000] = flat_offset(cell.x, cell.y - 0, cell.z - 0);
                             ltriangles[3 + swap] = flat_offset(cell.x, cell.y - 0, cell.z - 1);
+                            ltriangles[4 + 0000] = flat_offset(cell.x, cell.y - 0, cell.z - 0);
+                            ltriangles[5 - swap] = flat_offset(cell.x, cell.y - 1, cell.z - 0);
 
                             uint index_start;
                             region_indirect.InterlockedAdd(0, (uint)6, index_start);
@@ -364,7 +253,7 @@ compute_shader: {
         }
 
         [branch]
-        if (change_idx >= 1) {
+        if (change_idx > 1) {
             const float edge_signs[2][2][2] = {
                 step(0, v[0][0][0].w) * 2 - 1,
                 step(0, v[0][0][1].w) * 2 - 1,
@@ -375,7 +264,8 @@ compute_shader: {
                 step(0, v[1][1][0].w) * 2 - 1,
                 step(0, v[1][1][1].w) * 2 - 1,
             };
-            float3 vertex_in_cell = find_vertex(changes, normals, edge_signs, change_idx);
+            //float3 vertex_in_cell = find_vertex(changes, normals, edge_signs, change_idx);
+            float3 vertex_in_cell = min_qef(changes, normals, change_idx);
 
             float3 wp = vertex_in_cell + cellf - margin;
             float3 wn = normalize(trilerp(v, vertex_in_cell));
