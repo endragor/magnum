@@ -1,5 +1,5 @@
 common: [[
-    #define REGION_SIZE 36
+    #define REGION_SIZE 32
     #define REGION_MARGIN 2
 
     float4 sphere_density(float3 p, float3 c, float r) {
@@ -18,8 +18,9 @@ common: [[
         return -((cell_size) - 4.0) * 0.3;
     }
 
+    // offset for cell corner
     uint flat_offset(uint x, uint y, uint z) {
-        return x * REGION_SIZE * REGION_SIZE + y * REGION_SIZE + z;
+        return x * (REGION_SIZE + 1) * (REGION_SIZE + 1) + y * (REGION_SIZE + 1) + z;
     }
 
     float3 trilerp(float3 corners[2][2][2], float3 c) {

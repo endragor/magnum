@@ -13,7 +13,7 @@ struct mag_region_tree_t;
 typedef struct mag_region_tree_t mag_region_tree_t;
 
 enum {
-    MAG_VOXEL_CHUNK_SIZE = 32,
+    MAG_VOXEL_CHUNK_SIZE = 28,
     MAG_VOXEL_MARGIN = 2,
     MAG_VOXEL_REGION_SIZE = (MAG_VOXEL_CHUNK_SIZE + MAG_VOXEL_MARGIN * 2),
 };

@@ -1,0 +1,119 @@
+imports: [
+    { name: "densities" type: "buffer" }
+    { name: "octree" type: "buffer" uav: true }
+]
+
+compile: {
+    includes: [ "magnum_common" ]
+
+    variations : [
+        { systems: ["magnum_dc_octree"] }
+    ]
+}
+
+compute_shader: {
+    import_system_semantics: [ "dispatch_thread_id" ]
+
+    attributes: {
+        num_threads: [32, 1, 1]
+    }
+
+    code: [[
+        uint3 cell = dispatch_thread_id;
+        float4 v[2][2][2];
+        load_cell_densities(get_densities(), cell, v);
+
+        float3 p[12];
+        float3 n[12];
+        uint count = 0;
+
+        {
+            for (uint dx = 0; dx != 2; ++dx) {
+                for (uint dy = 0; dy != 2; ++dy) {
+                    float v0 = v[dx][dy][0].w;
+                    float v1 = v[dx][dy][1].w;
+                    float solid0 = step(v0, 0);
+                    float solid1 = step(v1, 0);
+                    [branch]
+                    if (solid0 != solid1) {
+                        float distance = v0 / (v0 - v1);
+                        p[count] = float3((float)dx, (float)dy, distance);
+                        n[count] = normalize(lerp(v[dx][dy][0].xyz, v[dx][dy][1].xyz, distance));
+                        //n[count] = trilerp(v, p[count]);
+                        //n[count] = normalize(float3(nx, ny, nz));
+                        //n[count] = magnum_density((cellf + p[count] - margin) * cell_size + load_region_pos(), cell_size).xyz;
+                        ++count;
+                    }
+                }
+            }
+        }
+
+        {
+            for (uint dx = 0; dx != 2; ++dx) {
+                for (uint dz = 0; dz != 2; ++dz) {
+                    float v0 = v[dx][0][dz].w;
+                    float v1 = v[dx][1][dz].w;
+                    float solid0 = step(v0, 0);
+                    float solid1 = step(v1, 0);
+                    [branch]
+                    if (solid0 != solid1) {
+                        float distance = v0 / (v0 - v1);
+                        p[count] = float3((float)dx, distance, (float)dz);
+                        n[count] = normalize(lerp(v[dx][0][dz].xyz, v[dx][1][dz].xyz, distance));
+                        //n[count] = trilerp(v, p[count]);
+                        //n[count] = magnum_density((cellf + p[count] - margin) * cell_size + load_region_pos(), cell_size).xyz;
+                        ++count;
+                    }
+                }
+            }
+        }
+
+        {
+            for (uint dy = 0; dy != 2; ++dy) {
+                for (uint dz = 0; dz != 2; ++dz) {
+                    float v0 = v[0][dy][dz].w;
+                    float v1 = v[1][dy][dz].w;
+                    float solid0 = step(v0, 0);
+                    float solid1 = step(v1, 0);
+                    [branch]
+                    if (solid0 != solid1) {
+                        float distance = v0 / (v0 - v1);
+                        p[count] = float3(distance, (float)dy, (float)dz);
+                        n[count] = normalize(lerp(v[0][dy][dz].xyz, v[1][dy][dz].xyz, distance));
+                        //n[count] = trilerp(v, p[count]);
+                        //n[count] = magnum_density((cellf + p[count] - margin) * cell_size + load_region_pos(), cell_size).xyz;
+                        ++count;
+                    }
+                }
+            }
+        }
+
+        [branch]
+        if (count > 1) {
+            octree_node_t node;
+            node.diagA = 0;
+            node.upperA = 0;
+            node.bc = 0;
+            node.edge_sum = 0;
+            node.child_mask = count << 8;
+            node.vertex_id = cell.x * REGION_SIZE * REGION_SIZE + cell.y * REGION_SIZE + cell.z;
+
+            float3 cellf = (float3)cell;
+
+            for (uint i = 0; i < count; ++i) {
+                node.diagA += n[i] * n[i];
+                node.upperA += n[i].xxy * n[i].yzz;
+
+                float d = dot(n[i], p[i] + cellf);
+                node.bc.w += d * d;
+                node.bc.xyz += n[i] * d;
+            }
+
+            for (uint ip = 0; ip < count; ip++) {
+                node.edge_sum += p[ip] + cellf;
+            }
+
+            add_cell(get_octree(), cell, node);
+        }
+    ]]
+}

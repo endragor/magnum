@@ -33,7 +33,7 @@ compute_shader: {
             float3 cur = ro + cur_length * rd;
             for (uint i = 0; i < region_count; ++i) {
                 float3 inner_point = (cur - (load_region_positions(i) - margin)) / cell_size;
-                bool3 is_inside = inner_point >= 0 && inner_point < region_size;
+                bool3 is_inside = inner_point >= 0 && inner_point <= region_size;
                 [branch]
                 if (is_inside.x && is_inside.y && is_inside.z) {
                     had_inside = true;

@@ -1,0 +1,26 @@
+imports: [
+    { name: "densities" type: "buffer" }
+    { name: "octree" type: "buffer" }
+
+    { name: "root_id" type: "uint" }
+    { name: "tolerance" type: "float" }
+
+    { name: "collapsed_octree" type: "buffer" uav: true }
+    { name: "vertices" type: "buffer" uav: true }
+]
+
+compile: {
+    variations : [
+        { systems: ["magnum_dc_octree"] }
+    ]
+}
+
+compute_shader: {
+    attributes: {
+        num_threads: [1, 1, 1]
+    }
+
+    code: [[
+        try_collapse(get_octree(), load_root_id(), load_tolerance(), get_densities(), get_collapsed_octree(), get_vertices());
+    ]]
+}

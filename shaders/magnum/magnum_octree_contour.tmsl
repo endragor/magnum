@@ -1,0 +1,23 @@
+imports: [
+    { name: "collapsed_octree" type: "buffer" }
+    { name: "root_id" type: "uint" }
+
+    { name: "index_counter" type: "buffer" uav: true }
+    { name: "triangles" type: "buffer" uav: true }
+]
+
+compile: {
+    variations : [
+        { systems: ["magnum_dc_octree"] }
+    ]
+}
+
+compute_shader: {
+    attributes: {
+        num_threads: [1, 1, 1]
+    }
+
+    code: [[
+        dual_contour_octree(get_collapsed_octree(), load_root_id(), get_triangles(), get_index_counter());
+    ]]
+}
