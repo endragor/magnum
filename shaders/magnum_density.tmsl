@@ -1,0 +1,397 @@
+imports: [
+    { name: "rot_mat" type: "float4x4" elements: 9 }
+]
+
+common: [[
+    float hash1( float2 p )
+    {
+        p  = 50.0*frac( p*0.3183099 );
+        return frac( p.x*p.y*(p.x+p.y) );
+    }
+
+    float hash1( float n )
+    {
+        return frac( n*17.0*frac( n*0.3183099 ) );
+    }
+
+    float2 hash2( float2 p )
+    {
+        const float2 k = float2( 0.3183099, 0.3678794 );
+        float n = 111.0*p.x + 113.0*p.y;
+        return frac(n*frac(k*n));
+    }
+
+    float3 rot(float3 coord, float4x4 mat) {
+        return float3( dot(mat._11_12_13, coord),
+                        dot(mat._21_22_23, coord),
+                        dot(mat._31_32_33, coord) );
+    }
+
+    float noise( in float3 x , in float coefs[8])
+    {
+        float3 p = floor(x);
+        float3 w = frac(x);
+
+        float3 u = w*w*w*(w*(w*6.0-15.0)+10.0);
+
+        float n = coefs[1] * p.x + coefs[2]*p.y + coefs[4]*p.z;
+
+        float a = hash1(n+coefs[0]);
+        float b = hash1(n+coefs[1]);
+        float c = hash1(n+coefs[2]);
+        float d = hash1(n+coefs[3]);
+        float e = hash1(n+coefs[4]);
+        float f = hash1(n+coefs[5]);
+        float g = hash1(n+coefs[6]);
+        float h = hash1(n+coefs[7]);
+
+        float k0 =   a;
+        float k1 =   b - a;
+        float k2 =   c - a;
+        float k3 =   e - a;
+        float k4 =   a - b - c + d;
+        float k5 =   a - c - e + g;
+        float k6 =   a - b - e + f;
+        float k7 = - a + b + c - d + e - f - g + h;
+
+        return -1.0+2.0*(k0 + k1*u.x + k2*u.y + k3*u.z + k4*u.x*u.y + k5*u.y*u.z + k6*u.z*u.x + k7*u.x*u.y*u.z);
+    }
+
+    float noise( in float2 x )
+    {
+        float2 p = floor(x);
+        float2 w = frac(x);
+        #if 1
+        float2 u = w*w*w*(w*(w*6.0-15.0)+10.0);
+        #else
+        float2 u = w*w*(3.0-2.0*w);
+        #endif
+
+        float n = p.x + 317.0*p.y;
+
+        float a = hash1(n);
+        float b = hash1(n + 1.0);
+        float c = hash1(n + 317.0);
+        float d = hash1(n + 318.0);
+
+        return -1.0+2.0*(a + (b-a)*u.x + (c-a)*u.y + (a - b - c + d)*u.x*u.y);
+    }
+
+    float fbm(float3 p, float f, float a, uint octaves, in float coefs[8]) {
+        float G = 0.5;
+        float t = 0.0;
+
+        float muls[9] = {
+            2.01,
+            1.99,
+            1.97,
+            2.03,
+            2.04,
+            1.97,
+            1.97,
+            1.97,
+            1.97,
+        };
+
+        for(uint i = 0; i < octaves; i++)
+        {
+            t += a * noise(f * p, coefs);
+            f *= muls[i];
+            a *= G;
+        }
+        return t;
+    }
+
+    float fbm(float2 p, float f, float a, uint octaves) {
+        float G = 0.5;
+        float t = 0.0;
+
+        float muls[9] = {
+            2.01,
+            1.99,
+            1.97,
+            2.03,
+            2.04,
+            1.97,
+            1.97,
+            1.97,
+            1.97,
+        };
+
+        for(uint i = 0; i < octaves; i++)
+        {
+            t += a * noise(f * p);
+            f *= muls[i];
+            a *= G;
+        }
+        return t;
+    }
+
+    float4 noised( in float3 x , in float coefs[8]) {
+        float3 p = floor(x);
+        float3 w = frac(x);
+
+        float3 u = w*w*w*(w*(w*6.0-15.0)+10.0);
+        float3 du = 30.0*w*w*(w*(w-2.0)+1.0);
+
+        float n = coefs[1] * p.x + coefs[2]*p.y + coefs[4]*p.z;
+
+        float a = hash1(n+coefs[0]);
+        float b = hash1(n+coefs[1]);
+        float c = hash1(n+coefs[2]);
+        float d = hash1(n+coefs[3]);
+        float e = hash1(n+coefs[4]);
+        float f = hash1(n+coefs[5]);
+        float g = hash1(n+coefs[6]);
+        float h = hash1(n+coefs[7]);
+
+        float k0 =   a;
+        float k1 =   b - a;
+        float k2 =   c - a;
+        float k3 =   e - a;
+        float k4 =   a - b - c + d;
+        float k5 =   a - c - e + g;
+        float k6 =   a - b - e + f;
+        float k7 = - a + b + c - d + e - f - g + h;
+
+        return float4( -1.0+2.0*(k0 + k1*u.x + k2*u.y + k3*u.z + k4*u.x*u.y + k5*u.y*u.z + k6*u.z*u.x + k7*u.x*u.y*u.z),
+                    2.0* du * float3( k1 + k4*u.y + k6*u.z + k7*u.y*u.z,
+                                    k2 + k5*u.z + k4*u.x + k7*u.z*u.x,
+                                    k3 + k6*u.x + k5*u.y + k7*u.x*u.y ) );
+    }
+
+    float4 fbmd( float3 x, float scale, float b, uint octaves, in float coefs[8]) {
+
+        const float3x3 m3  = float3x3( 0.00,  0.80,  0.60,
+                            -0.80,  0.36, -0.48,
+                            -0.60, -0.48,  0.64 );
+        const float3x3 m3i = float3x3( 0.00, -0.80, -0.60,
+                            0.80,  0.36, -0.48,
+                            0.60, -0.48,  0.64 );
+
+        const float muls[9] = {
+            2.05,
+            1.92,
+            1.97,
+            2.03,
+            2.04,
+            1.94,
+            2.02,
+            2.03,
+            1.96,
+        };
+        x *= scale;
+
+        float s = 0.5;
+        float a = 0.0;
+        float3 d = 0.0;
+        float3x3 m = float3x3(1.0,0.0,0.0,
+        0.0,1.0,0.0,
+        0.0,0.0,1.0);
+        for( int i=0; i < octaves; i++ )
+        {
+            float4 n = noised(x, coefs);
+            a += b*n.x;          // accumulate values
+            d += b*mul(m, n.yzw);      // accumulate derivatives
+            b *= s;
+            x = muls[i]*mul(m3, x);
+            m = muls[i]*mul(m3i, m);
+        }
+
+        return float4(d * scale, a);
+    }
+
+    //float density(float3 p) {
+        //return p.y + fbm(p / 500.0, 50.0, 1.98, 4);
+        //return p.y + (50.0 + 50.0 * cnoise(p / 100.0));
+    //}
+
+    float4 opU(float4 d1, float4 d2) {
+        return float4(lerp(d1.xyz, d2.xyz, step(d2.w, d1.w)), min(d1.w, d2.w));
+    }
+
+    float4 opSub(float4 d1, float4 d2) {
+        return float4(lerp(d1.xyz, d2.xyz, step(d1.w, -d2.w)), max(-d2.w, d1.w));
+    }
+
+    float4 plains(float3 p) {
+        float4 ret = 0;
+
+        const float coefs0[8] = {
+            0.0,
+            1.0,
+            317.0,
+            318.0,
+            157.0,
+            158.0,
+            474.0,
+            475.0
+        };
+
+        const float coefs1[8] = {
+            0.0,
+            1.0,
+            260.0,
+            261.0,
+            832.0,
+            833.0,
+            543.0,
+            544.0
+        };
+
+        const float coefs2[8] = {
+            0.0,
+            1.0,
+            751.0,
+            762.0,
+            402.0,
+            403.0,
+            518.0,
+            519.0
+        };
+
+        const float coefs3[8] = {
+            0.0,
+            1.0,
+            382.0,
+            383.0,
+            444.0,
+            445.0,
+            678.0,
+            679.0
+        };
+
+        //p *= 32.0;
+
+        float warp_f = 0.003;
+        float warp_a = 2.0;
+        uint warp_o = 2;
+        float3 q = float3(
+            fbm(p, warp_f, warp_a, warp_o, coefs0),
+            fbm(p + warp_a * float3(5.2, 1.3, 3.8), warp_f, warp_a, warp_o, coefs0),
+            fbm(p + warp_a * float3(8.8, 4.1, 6.3), warp_f, warp_a, warp_o, coefs0)
+        );
+        float3 r = float3(
+            fbm(p + 8 * q + warp_a * float3(1.5, 8.3, 4.1), warp_f, warp_a, warp_o, coefs0),
+            fbm(p + 8 * q + warp_a * float3(9.9, 1.9, 4.4), warp_f, warp_a, warp_o, coefs0),
+            fbm(p + 8 * q + warp_a * float3(8.2, 3.7, 5.5), warp_f, warp_a, warp_o, coefs0)
+        );
+        float3 m = float3(
+            fbm(p + 8 * r + warp_a * float3(1.5, 8.3, 4.1), warp_f, warp_a, warp_o, coefs0),
+            fbm(p + 8 * r + warp_a * float3(9.9, 1.9, 4.4), warp_f, warp_a, warp_o, coefs0),
+            fbm(p + 8 * r + warp_a * float3(8.2, 3.7, 5.5), warp_f, warp_a, warp_o, coefs0)
+        );
+
+        float2 q2 = float2(
+            fbm(p.xz, warp_f, warp_a, warp_o),
+            fbm(p.xz + warp_a * float2(5.2, 1.3), warp_f, warp_a, warp_o)
+        );
+        float2 r2 = float2(
+            fbm(p.xz + 4 * q2 + warp_a * float2(1.5, 8.3), warp_f, warp_a, warp_o),
+            fbm(p.xz + 4 * q2 + warp_a * float2(9.9, 1.9), warp_f, warp_a, warp_o)
+        );
+        float2 m2 = float2(
+            fbm(p.xz + 4 * r2 + warp_a * float2(1.5, 8.3), warp_f, warp_a, warp_o),
+            fbm(p.xz + 4 * r2 + warp_a * float2(9.9, 1.9), warp_f, warp_a, warp_o)
+        );
+
+        float h = fbm(p.xz + 4 * r2, warp_f, warp_a, warp_o);
+
+        //p += 16 * m;
+        //p *= 25;
+
+        float3 c0 = rot(p, load_rot_mat(0));
+        float3 c1 = rot(p, load_rot_mat(1));
+        float3 c2 = rot(p, load_rot_mat(2));
+        float3 c3 = rot(p, load_rot_mat(3));
+        float3 c4 = rot(p, load_rot_mat(4));
+        float3 c5 = rot(p, load_rot_mat(5));
+        float3 c6 = rot(p, load_rot_mat(6));
+        float3 c7 = rot(p, load_rot_mat(7));
+        float3 c8 = rot(p, load_rot_mat(8));
+
+        // fbmd(pos +  8 * f(pos))
+        // d = d.xyz * (1 + 8 * )
+        float amult = h;
+        float fmult = 0.5;
+        ret -= fbmd(p, fmult * 0.1600 * 1.021, amult * 0.32 * 1.16, 1, coefs0);
+        ret -= fbmd(p, fmult * 0.0800 * 0.985, amult * 0.64 * 1.12, 1, coefs0);
+        ret -= fbmd(p, fmult * 0.0400 * 1.051, amult * 1.28 * 1.08, 1, coefs0);
+        ret -= fbmd(p, fmult * 0.0200 * 1.020, amult * 2.56 * 1.04, 1, coefs0);
+        ret -= fbmd(p, fmult * 0.0100 * 0.968, amult * 5.00 * 1.00, 1, coefs0);
+        ret -= fbmd(p, fmult * 0.0050 * 0.994, amult * 10.0 * 1.00, 1, coefs0);
+        ret -= fbmd(c1, fmult * 0.0025 * 1.045, amult * 20.0 * 0.90, 1, coefs0);
+        ret -= fbmd(c0, fmult * 0.0012 * 0.972, amult * 40.0 * 0.80, 1, coefs0);
+
+        //ret += fbmd(p, 1.0, 80.0, 1, coefs);
+        //ret += fbmd(p, 0.0041, 80.0, 1);
+        //ret += fbmd(p, 0.001, 100.0, 6);
+        //ret += fbmd(p, 0.01, 4.98, 5);
+
+        //ret.xyz *= (float3(1, 1, 1) + 8 * float3(wx.w, wy.w, wz.w));
+        return ret;
+    }
+
+    //float4 worms(float3 pos) {
+        //float4 ret = 0;
+        //ret.w = 12;
+
+        //ret += fbmd(pos, 0.000718, 30.0, 2);
+//
+        //return -ret;
+    //}
+
+    float4 sphered(float3 p, float3 c, float r) {
+        float4 ret;
+
+        float3 diff = p - c;
+        float diff_len = length(diff);
+        ret.w = diff_len - r;
+        ret.xyz = diff / diff_len;// / diff_len;
+
+        return ret;
+    }
+
+    float4 the_density(float3 pos) {
+        float4 ret = 0;
+        ret.w = pos.y;
+        ret.xyz = float3(0, 1.0, 0);
+
+        //ret = worms(pos);
+        ret += plains(pos);
+        //ret = opUnion(ret, worms(pos));
+        //ret = sphered(pos, 0, 100);
+
+        //density += fbmd(pos, 0.000888, 200.0, 16.21, 2, derivative);
+
+        //density += fbmd(pos, 0.0888, 200.0, 16.21, 2, derivative);
+        //density += saturate((-4 - ws_orig.y*0.3)*3.0)*40 * uulf_rand2.z;
+
+        //ret.w = density(pos);
+        //ret.xyz = calcNormal(pos, cell_size);
+
+        ret.xyz = normalize(ret.xyz);
+        return ret;
+    }
+
+    float3 calcNormal(float3 p, float cell_size) {
+        float2 k = float2(1.0,-1.0);
+        float h = cell_size * cell_size * 0.00001;
+        return normalize( k.xyy*the_density( p + k.xyy * h).w +
+					  k.yyx*the_density( p + k.yyx * h).w +
+					  k.yxy*the_density( p + k.yxy * h).w +
+					  k.xxx*the_density( p + k.xxx * h).w );
+    }
+
+
+    // xyz - normal, w - density
+    float4 magnum_density(float3 pos, float cell_size) {
+        float4 ret = the_density(pos);
+
+        //ret.xyz = calcNormal(pos, cell_size);
+
+        return ret;
+    }
+]]
+
+system: { }
