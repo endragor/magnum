@@ -3,7 +3,7 @@ imports: [
     { name: "cell_size" type: "float" }
 
     { name: "densities" type: "buffer" }
-    { name: "region_indirect" type: "buffer" uav: true }
+    { name: "region_info" type: "buffer" uav: true }
     { name: "vertices" type: "buffer" uav: true }
     { name: "triangles" type: "buffer" uav: true }
 ]
@@ -118,7 +118,7 @@ compute_shader: {
         // normals at the positions
         float3 normals[12];
         uint change_idx = 0;
-        RWByteAddressBuffer region_indirect = get_region_indirect();
+        RWByteAddressBuffer region_info = get_region_info();
         RWByteAddressBuffer triangles = get_triangles();
         float3 margin = float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN);
         float cell_size = load_cell_size();
@@ -154,7 +154,7 @@ compute_shader: {
                             ltriangles[5 - swap] = flat_offset(cell.x - 0, cell.y - 0, cell.z);
 
                             uint index_start;
-                            region_indirect.InterlockedAdd(0, (uint)6, index_start);
+                            region_info.InterlockedAdd(0, (uint)6, index_start);
                             uint3 index_data = uint3(
                                 (ltriangles[0]) | (ltriangles[1] << 16),
                                 (ltriangles[2]) | (ltriangles[3] << 16),
@@ -197,7 +197,7 @@ compute_shader: {
                             ltriangles[5 - swap] = flat_offset(cell.x - 1, cell.y, cell.z - 0);
 
                             uint index_start;
-                            region_indirect.InterlockedAdd(0, (uint)6, index_start);
+                            region_info.InterlockedAdd(0, (uint)6, index_start);
                             uint3 index_data = uint3(
                                 (ltriangles[0]) | (ltriangles[1] << 16),
                                 (ltriangles[2]) | (ltriangles[3] << 16),
@@ -239,7 +239,7 @@ compute_shader: {
                             ltriangles[5 - swap] = flat_offset(cell.x, cell.y - 1, cell.z - 0);
 
                             uint index_start;
-                            region_indirect.InterlockedAdd(0, (uint)6, index_start);
+                            region_info.InterlockedAdd(0, (uint)6, index_start);
                             uint3 index_data = uint3(
                                 (ltriangles[0]) | (ltriangles[1] << 16),
                                 (ltriangles[2]) | (ltriangles[3] << 16),
@@ -280,6 +280,7 @@ compute_shader: {
 
             uint vertex_offset = flat_offset(cell.x, cell.y, cell.z);
             get_vertices().Store3(vertex_offset * 12, vertex_data);
+            update_region_bounds(region_info, wp);
         }
     ]]
 }

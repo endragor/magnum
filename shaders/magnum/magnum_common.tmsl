@@ -15,7 +15,7 @@ common: [[
 
     float density_bias(float cell_size) {
         //return 0;
-        return -((cell_size) - 4.0) * 0.3;
+        return -((cell_size * cell_size) - 2.0) * 0.0001;
     }
 
     // offset for cell corner
@@ -101,5 +101,18 @@ common: [[
         load_two_densities(densities, cell + uint3(0, 1, 0), v[0][1]);
         load_two_densities(densities, cell + uint3(1, 0, 0), v[1][0]);
         load_two_densities(densities, cell + uint3(1, 1, 0), v[1][1]);
+    }
+
+    void update_region_bounds(RWByteAddressBuffer region_info, float3 wp) {
+        float3 wp_transformed = max(0.0, (wp + (REGION_MARGIN + 1))) * 1000.0;
+        uint3 minimum = floor(wp_transformed);
+        uint3 maximum = ceil(wp_transformed);
+        region_info.InterlockedMin(4,  minimum.x);
+        region_info.InterlockedMin(8,  minimum.y);
+        region_info.InterlockedMin(12, minimum.z);
+
+        region_info.InterlockedMax(16, maximum.x);
+        region_info.InterlockedMax(20, maximum.y);
+        region_info.InterlockedMax(24, maximum.z);
     }
 ]]

@@ -7,6 +7,7 @@ imports: [
 
     { name: "collapsed_octree" type: "buffer" uav: true }
     { name: "vertices" type: "buffer" uav: true }
+    { name: "region_info" type: "buffer" uav: true }
 ]
 
 compile: {
@@ -21,6 +22,6 @@ compute_shader: {
     }
 
     code: [[
-        try_collapse(get_octree(), load_root_id(), load_tolerance(), get_densities(), get_collapsed_octree(), get_vertices());
+        try_collapse(get_octree(), load_root_id(), load_tolerance(), get_densities(), get_collapsed_octree(), get_vertices(), get_region_info());
     ]]
 }

@@ -1078,6 +1078,7 @@ common: [[
                         f32tof16(wn.y) | (f32tof16(wn.z) << 16)
                     );
                     vertices.Store3(nodes[cur_depth].vertex_id * 12, vertex_data);
+                    update_region_bounds(region_info, wp);
 
                     // if leaf, increment parent's leaf counter and add QEF values
                     ++node_info[cur_depth - 1].z;
