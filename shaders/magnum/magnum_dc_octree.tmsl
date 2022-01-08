@@ -980,7 +980,7 @@ common: [[
         return true;
     }
 
-    void try_collapse(ByteAddressBuffer octree, uint root_id, float tolerance, ByteAddressBuffer densities, RWByteAddressBuffer collapsed_octree, RWByteAddressBuffer vertices) {
+    void try_collapse(ByteAddressBuffer octree, uint root_id, float tolerance, ByteAddressBuffer densities, RWByteAddressBuffer collapsed_octree, RWByteAddressBuffer vertices, RWByteAddressBuffer region_info) {
         // x - index of the current child
         // y - id
         // z - number of leaf children
@@ -1033,7 +1033,7 @@ common: [[
                     for (uint i = 0; i < 8; ++i) {
                         [branch]
                         if ((child_mask & (1u << i)) == 0) {
-                            child_signs[cur_depth][i] = sign_mask & (1u << i) ? 255 : 0;
+                            child_signs[cur_depth][i] = (sign_mask & (1u << i)) ? 255 : 0;
                         }
                     }
 
