@@ -37,7 +37,7 @@ static struct mag_terrain_api *mag_terrain_api;
 #include "plugins/mag_terrain_component/mag_terrain_component.h"
 
 #define MAX_OPS_PER_SECOND 5
-#define MAX_SCULPT_DISTANCE 120.0
+#define MAX_SCULPT_DISTANCE 200.0
 
 typedef struct tm_simulation_state_o
 {
