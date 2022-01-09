@@ -26,6 +26,8 @@ enum {
     MAG_TT_PROP__TERRAIN_MATERIAL__TEXTURES, // reference [[TM_TT_TYPE__CREATION_GRAPH]]
     MAG_TT_PROP__TERRAIN_MATERIAL__ALLOW_FROM_TOP, // bool
     MAG_TT_PROP__TERRAIN_MATERIAL__ALLOW_FROM_SIDES, // bool
+    MAG_TT_PROP__TERRAIN_MATERIAL__PHYSICS_MATERIAL, // reference [[TM_TT_TYPE__PHYSICS_MATERIAL]]
+    MAG_TT_PROP__TERRAIN_MATERIAL__PHYSICS_COLLISION, // reference [[TM_TT_TYPE__PHYSICS_COLLISION]]
 };
 
 // Manager for terrain engine. Get it using [[tm_entity_api->component_manager()]].

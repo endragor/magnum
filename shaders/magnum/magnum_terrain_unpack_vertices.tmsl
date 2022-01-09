@@ -16,9 +16,9 @@ compute_shader: {
         uint vertex_idx = dispatch_thread_id.x;
         uint2 packed_pair = get_packed_vertices().Load2(vertex_idx * 12);
         float3 unpacked = float3(
-            f16tof32(packed_pair.x & 0xFF),
+            f16tof32(packed_pair.x & 0xFFFF),
             f16tof32(packed_pair.x >> 16),
-            f16tof32(packed_pair.y & 0xFF)
+            f16tof32(packed_pair.y & 0xFFFF)
         );
         get_unpacked_vertices().Store3(vertex_idx * 12, asuint(unpacked));
     ]]

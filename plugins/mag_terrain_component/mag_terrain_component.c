@@ -58,6 +58,8 @@ static struct mag_async_gpu_queue_api *mag_async_gpu_queue_api;
 #include <plugins/editor_views/properties.h>
 #include <plugins/entity/entity.h>
 #include <plugins/entity/transform_component.h>
+#include <plugins/physics/physics_collision.h>
+#include <plugins/physics/physics_material.h>
 #include <plugins/physics/physics_shape_component.h>
 #include <plugins/render_graph/render_graph.h>
 #include <plugins/render_graph_toolbox/render_pipeline.h>
@@ -98,11 +100,11 @@ static const struct
     bool needs_physics;
 } LODS[] = {
     // { 64.f, 1.f, 15 },
-    { 20.f, 2.f, 0.15f, 8, true},
+    { 20.f, 2.f, 0.15f, 8, true },
     { 64.f, 10.f, 0.15f, 10, true },
     { 256.f, 20.f, 0.5f, 10, true },
-    { 2048.f, 40.f, 1.f, 14, false },
-    { 10000.f, 128.f, 1.f, 20, false },
+    { 2048.f, 40.f, 1.f, 14, true },
+    //{ 10000.f, 128.f, 1.f, 20, false },
     //{ 128.f, 10.f / 32.f, 15 },
     // { 256.f, 2.f, 10 },
     // { 1024.f, 8.f, 16 },
@@ -191,8 +193,12 @@ static inline uint64_t region_priority(const region_data_t *region_data, const t
 typedef struct mag_terrain_material_t
 {
     tm_creation_graph_instance_t creation_graph_instance;
+    float static_friction;
+    float dynamic_friction;
+    float restitution;
     bool allow_from_top;
     bool allow_from_sides;
+    tm_tt_id_t collision_id;
 
 } mag_terrain_material_t;
 
@@ -474,10 +480,12 @@ static void create_settings_type(struct tm_the_truth_o *tt)
 static void create_material_type(struct tm_the_truth_o *tt)
 {
     static const tm_the_truth_property_definition_t properties[] = {
-        { "order", TM_THE_TRUTH_PROPERTY_TYPE_DOUBLE },
-        { "textures", TM_THE_TRUTH_PROPERTY_TYPE_SUBOBJECT, .type_hash = TM_TT_TYPE_HASH__CREATION_GRAPH },
-        { "allow_from_top", TM_THE_TRUTH_PROPERTY_TYPE_BOOL },
-        { "allow_from_sides", TM_THE_TRUTH_PROPERTY_TYPE_BOOL },
+        [MAG_TT_PROP__TERRAIN_MATERIAL__ORDER] = { "order", TM_THE_TRUTH_PROPERTY_TYPE_DOUBLE },
+        [MAG_TT_PROP__TERRAIN_MATERIAL__TEXTURES] = { "textures", TM_THE_TRUTH_PROPERTY_TYPE_SUBOBJECT, .type_hash = TM_TT_TYPE_HASH__CREATION_GRAPH },
+        [MAG_TT_PROP__TERRAIN_MATERIAL__ALLOW_FROM_TOP] = { "allow_from_top", TM_THE_TRUTH_PROPERTY_TYPE_BOOL },
+        [MAG_TT_PROP__TERRAIN_MATERIAL__ALLOW_FROM_SIDES] = { "allow_from_sides", TM_THE_TRUTH_PROPERTY_TYPE_BOOL },
+        [MAG_TT_PROP__TERRAIN_MATERIAL__PHYSICS_MATERIAL] = { "physics_material", TM_THE_TRUTH_PROPERTY_TYPE_REFERENCE, .type_hash = TM_TT_TYPE_HASH__PHYSICS_MATERIAL },
+        [MAG_TT_PROP__TERRAIN_MATERIAL__PHYSICS_COLLISION] = { "physics_collision", TM_THE_TRUTH_PROPERTY_TYPE_REFERENCE, .type_hash = TM_TT_TYPE_HASH__PHYSICS_COLLISION },
     };
 
     const tm_tt_type_t object_type = tm_the_truth_api->create_object_type(tt, MAG_TT_TYPE__TERRAIN_MATERIAL, properties, TM_ARRAY_COUNT(properties));
@@ -490,6 +498,8 @@ static void create_material_type(struct tm_the_truth_o *tt)
     tm_the_truth_api->set_default_object(tt, object_type, object);
 
     tm_tt_set_aspect(tt, object_type, tm_properties_aspect_i, material_properties_aspect);
+    tm_tt_set_property_aspect(tt, object_type, MAG_TT_PROP__TERRAIN_MATERIAL__PHYSICS_MATERIAL, tm_tt_prop_aspect__properties__asset_picker, TM_TT_TYPE__PHYSICS_MATERIAL);
+    tm_tt_set_property_aspect(tt, object_type, MAG_TT_PROP__TERRAIN_MATERIAL__PHYSICS_COLLISION, tm_tt_prop_aspect__properties__asset_picker, TM_TT_TYPE__PHYSICS_COLLISION);
 }
 
 static void create_truth_types(struct tm_the_truth_o *tt)
@@ -601,6 +611,17 @@ static bool load_asset(tm_component_manager_o *manager, struct tm_entity_command
             const tm_tt_id_t graph_asset = tm_the_truth_api->get_subobject(tt, mat_obj, MAG_TT_PROP__TERRAIN_MATERIAL__TEXTURES);
             merged_materials[im].material.allow_from_top = tm_the_truth_api->get_bool(tt, mat_obj, MAG_TT_PROP__TERRAIN_MATERIAL__ALLOW_FROM_TOP);
             merged_materials[im].material.allow_from_sides = tm_the_truth_api->get_bool(tt, mat_obj, MAG_TT_PROP__TERRAIN_MATERIAL__ALLOW_FROM_SIDES);
+
+            const tm_tt_id_t physics_material_id = tm_the_truth_api->get_reference(tt, mat_obj, MAG_TT_PROP__TERRAIN_MATERIAL__PHYSICS_MATERIAL);
+
+            if (physics_material_id.u64) {
+                const tm_the_truth_object_o *physics_material = tm_tt_read(tt, physics_material_id);
+
+                merged_materials[im].material.static_friction = tm_the_truth_api->get_float(tt, physics_material, TM_TT_PROP__PHYSICS_MATERIAL__STATIC_FRICTION);
+                merged_materials[im].material.dynamic_friction = tm_the_truth_api->get_float(tt, physics_material, TM_TT_PROP__PHYSICS_MATERIAL__DYNAMIC_FRICTION);
+                merged_materials[im].material.restitution = tm_the_truth_api->get_float(tt, physics_material, TM_TT_PROP__PHYSICS_MATERIAL__RESTITUTION);
+            }
+            merged_materials[im].material.collision_id = tm_the_truth_api->get_reference(tt, mat_obj, MAG_TT_PROP__TERRAIN_MATERIAL__PHYSICS_COLLISION);
 
             tm_creation_graph_context_t cg_ctx = (tm_creation_graph_context_t) { .rb = man->backend, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, .tt = truth };
             merged_materials[im].material.creation_graph_instance = tm_creation_graph_api->create_instance(truth, graph_asset, &cg_ctx);
@@ -992,14 +1013,20 @@ static void add(tm_component_manager_o *manager, struct tm_entity_commands_o *co
         .tt = tm_entity_api->the_truth(man->ctx),
         .physics_component = {
             .shape = TM_PHYSICS_SHAPE__MESH,
-            // TODO: configure these in The Truth
-            .collision_id = 0,
-            .material = {
-                .static_friction = 0.f,
-                .dynamic_friction = 0.f,
-                .restitution = 0.f },
+            .offset = {
+                .scl = (tm_vec3_t) { 1, 1, 1 },
+                .rot = (tm_vec4_t) { 0, 0, 0, 1 },
+            },
         },
     };
+    if (tm_carray_size(man->terrain_settings.materials)) {
+        c->physics_data->physics_component.collision_id = man->terrain_settings.materials[0].collision_id;
+        c->physics_data->physics_component.material = (tm_physics_shape_material_t) {
+            .static_friction = man->terrain_settings.materials[0].static_friction,
+            .dynamic_friction = man->terrain_settings.materials[0].dynamic_friction,
+            .restitution = man->terrain_settings.materials[0].restitution,
+        };
+    }
     tm_os_api->thread->create_critical_section(&c->physics_data->cs);
 }
 
@@ -1042,10 +1069,12 @@ static void remove(tm_component_manager_o *manager, struct tm_entity_commands_o 
     man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
 
     if (c->generate_task_id)
-        while (!mag_async_gpu_queue_api->is_task_done(man->gpu_queue, c->generate_task_id)) ;
+        while (!mag_async_gpu_queue_api->is_task_done(man->gpu_queue, c->generate_task_id))
+            ;
 
     if (c->read_mesh_task_id)
-        while (!mag_async_gpu_queue_api->is_task_done(man->gpu_queue, c->read_mesh_task_id)) ;
+        while (!mag_async_gpu_queue_api->is_task_done(man->gpu_queue, c->read_mesh_task_id))
+            ;
 
     tm_carray_free(c->buffers->indices, &man->allocator);
     tm_carray_free(c->buffers->vertices, &man->allocator);
@@ -1140,6 +1169,8 @@ static float material_properties_ui(struct tm_properties_ui_args_t *args, tm_rec
     item_rect.y = tm_properties_view_api->ui_subobject(args, item_rect, TM_LOCALIZE("Creation Graph"), NULL, object, MAG_TT_PROP__TERRAIN_MATERIAL__TEXTURES, false);
     item_rect.y = tm_properties_view_api->ui_bool(args, item_rect, TM_LOCALIZE("Allow From Top"), NULL, object, MAG_TT_PROP__TERRAIN_MATERIAL__ALLOW_FROM_TOP);
     item_rect.y = tm_properties_view_api->ui_bool(args, item_rect, TM_LOCALIZE("Allow From Sides"), NULL, object, MAG_TT_PROP__TERRAIN_MATERIAL__ALLOW_FROM_SIDES);
+    item_rect.y = tm_properties_view_api->ui_property(args, item_rect, object, MAG_TT_PROP__TERRAIN_MATERIAL__PHYSICS_MATERIAL);
+    item_rect.y = tm_properties_view_api->ui_property(args, item_rect, object, MAG_TT_PROP__TERRAIN_MATERIAL__PHYSICS_COLLISION);
 
     return item_rect.y;
 }
@@ -1766,7 +1797,7 @@ void read_mesh_task(mag_async_gpu_queue_task_args_t *args)
             .resource_state = TM_RENDERER_RESOURCE_STATE_COPY_SOURCE,
             .resource_queue = TM_RENDERER_QUEUE_GRAPHICS,
             .bits = c->indices,
-            .size = tm_carray_size(c->indices) * sizeof(*c->indices)});
+            .size = tm_carray_size(c->indices) * sizeof(*c->indices) });
 
     mag_async_gpu_queue_fence_t indices_fence = { .fence_id = indices_fence_id, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL };
     tm_carray_push(args->out_fences, indices_fence, args->fences_allocator);
@@ -1930,6 +1961,7 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
 
     const float dt = (float)tm_entity_api->get_blackboard_double(man->ctx, TM_ENTITY_BB__DELTA_TIME, 0);
     mag_terrain_component_t **free_components = NULL;
+
     tm_carray_temp_ensure(free_components, total_components, ta);
     uint64_t sort_key = 0;
     uint32_t active_task_count = 0;
@@ -1978,6 +2010,9 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
                     if (c->physics_data->buffer_id) {
                         tm_physics_shape_component_t *physics_component = tm_entity_commands_api->add_component(commands, a->entities[i], man->physics_shape_component_type);
                         *physics_component = c->physics_data->physics_component;
+                        physics_component->offset.pos = c->region_data.pos;
+                        float scl = LODS[c->region_data.lod].size;
+                        physics_component->offset.scl = (tm_vec3_t) { scl, scl, scl };
                         free_physics_data_arrays(man, c->physics_data);
                     }
                 }
@@ -2366,7 +2401,7 @@ static void entity_simulation__register(struct tm_entity_context_o *ctx)
     mag_terrain_component_manager_o *man = (mag_terrain_component_manager_o *)tm_entity_api->component_manager(ctx, mag_terrain_component);
     man->component_mask = tm_entity_api->create_component_mask((tm_component_type_t[2]) { transform_component, mag_terrain_component }, 2);
 
-    const tm_engine_i mirror_sound_sources = {
+    const tm_engine_i terrain_engine = {
         .ui_name = TM_LOCALIZE_LATER("Magnum Terrain"),
         .hash = MAG_ENGINE__TERRAIN,
         .num_components = 1,
@@ -2378,7 +2413,7 @@ static void entity_simulation__register(struct tm_entity_context_o *ctx)
         .after_me = { TM_PHASE__RENDER },
     };
 
-    tm_entity_api->register_engine(ctx, &mirror_sound_sources);
+    tm_entity_api->register_engine(ctx, &terrain_engine);
 }
 
 TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
