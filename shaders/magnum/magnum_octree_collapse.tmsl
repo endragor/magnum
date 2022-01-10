@@ -1,10 +1,11 @@
 imports: [
     { name: "densities" type: "buffer" }
-    { name: "octree" type: "buffer" }
 
-    { name: "root_id" type: "uint" }
+    { name: "first_node_id" type: "uint" }
+    { name: "first_node_depth" type: "uint" }
     { name: "tolerance" type: "float" }
 
+    { name: "octree" type: "buffer" uav: true}
     { name: "collapsed_octree" type: "buffer" uav: true }
     { name: "vertices" type: "buffer" uav: true }
     { name: "region_info" type: "buffer" uav: true }
@@ -17,11 +18,21 @@ compile: {
 }
 
 compute_shader: {
+
+    import_system_semantics: [ "dispatch_thread_id" ]
+
     attributes: {
-        num_threads: [1, 1, 1]
+        num_threads: [1, 8, 1]
     }
 
     code: [[
-        try_collapse(get_octree(), load_root_id(), load_tolerance(), get_densities(), get_collapsed_octree(), get_vertices(), get_region_info());
+        uint node_id = (load_first_node_id() + dispatch_thread_id.x) * 8 + dispatch_thread_id.y + 1;
+        uint parent_depth = load_first_node_depth();
+        collapse_one_node(get_octree(), node_id, parent_depth + 1, load_tolerance(), get_densities(), get_collapsed_octree(), get_vertices(), get_region_info());
+
+        [branch]
+        if (parent_depth == 0 && dispatch_thread_id.y == 0) {
+            get_collapsed_octree().Store(0, get_octree().Load(0) & 0xFF);
+        }
     ]]
 }

@@ -16,42 +16,22 @@ common: [[
         float3 edge_sum;
         // lower 8 bit - child mask, upper 24 bits - active edge count
         uint child_mask;
-        uint vertex_id;
+        // upper 8 bit - corner signs, lower 16 bit - vertex id
+        uint corner_signs_vertex_id;
     };
 
-    void add_cell(RWByteAddressBuffer octree, uint3 cell, octree_node_t node) {
-        uint3 c = uint3(REGION_SIZE >> 1, REGION_SIZE >> 1, REGION_SIZE >> 1);
-        uint3 s = c;
-        uint id = 0;
-        for (uint i = 0; i < OCTREE_DEPTH; ++i) {
-            uint3 idx3 = step(c, cell);
-            uint idx = (idx3.x << 2) | (idx3.y << 1) | (idx3.z << 0);
-            id = id * 8 + idx + 1;
-            s >>= 1;
-            c = c + idx3 * s - (1 - idx3) * s;
-        }
-
+    void store_node(RWByteAddressBuffer octree, uint id, octree_node_t node) {
         uint offset = OCTREE_NODE_SIZE * id;
         octree.Store4(offset, uint4(node.child_mask, asuint(node.diagA)));
         offset += 4 * 4;
-        octree.Store4(offset, uint4(asuint(node.upperA), node.vertex_id));
+        octree.Store4(offset, uint4(asuint(node.upperA), node.corner_signs_vertex_id));
         offset += 4 * 4;
         octree.Store4(offset, asuint(node.bc));
         offset += 4 * 4;
         octree.Store3(offset, asuint(node.edge_sum));
-
-        uint old_mask = 0;
-        while (id && !old_mask) {
-            id -= 1;
-            uint mask_in_parent = (1u << (id & 7));
-            id = id >> 3;
-
-            uint parent_offset = OCTREE_NODE_SIZE * id;
-            octree.InterlockedOr(parent_offset, mask_in_parent, old_mask);
-        }
     }
 
-    octree_node_t load_node(ByteAddressBuffer octree, uint id) {
+    octree_node_t load_node(RWByteAddressBuffer octree, uint id) {
         octree_node_t ret;
 
         uint offset = OCTREE_NODE_SIZE * id;
@@ -62,7 +42,7 @@ common: [[
         offset += 4 * 4;
         uint4 second = octree.Load4(offset);
         ret.upperA = asfloat(second.xyz);
-        ret.vertex_id = second.w;
+        ret.corner_signs_vertex_id = second.w;
 
         offset += 4 * 4;
         ret.bc = asfloat(octree.Load4(offset));
@@ -71,6 +51,40 @@ common: [[
         ret.edge_sum = asfloat(octree.Load3(offset));
 
         return ret;
+    }
+
+    void store_vertex(RWByteAddressBuffer vertices, RWByteAddressBuffer region_info, float3 qef_vertex, uint vertex_id, float4 v[2][2][2])  {
+        float3 clamped_vertex = clamp(qef_vertex, float3(0, 0, 0), float3(REGION_SIZE, REGION_SIZE, REGION_SIZE));
+        float3 wp = clamped_vertex - float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN);
+        float3 wn = normalize(trilerp(v, frac(clamped_vertex)));
+        uint3 vertex_data = uint3(
+            f32tof16(wp.x) | (f32tof16(wp.y) << 16),
+            f32tof16(wp.z) | (f32tof16(wn.x) << 16),
+            f32tof16(wn.y) | (f32tof16(wn.z) << 16)
+        );
+        vertices.Store3(vertex_id * 12, vertex_data);
+        update_region_bounds(region_info, wp);
+    }
+
+    void store_parent_corner_sign(RWByteAddressBuffer octree, uint id, uint corner_signs) {
+        uint parent_id = (id - 1) >> 3;
+        uint id_in_parent = (id - 1) & 7;
+        uint sign_bit = (corner_signs & (1u << id_in_parent)) >> id_in_parent;
+        octree.InterlockedOr(OCTREE_NODE_SIZE * parent_id + 28, sign_bit << (16 + id_in_parent));
+    }
+
+    uint cell_octree_id(uint3 cell) {
+        uint3 c = uint3(REGION_SIZE >> 1, REGION_SIZE >> 1, REGION_SIZE >> 1);
+        uint3 s = c;
+        uint id = 0;
+        for (uint i = 0; i < OCTREE_DEPTH; ++i) {
+            uint3 idx3 = step(c, cell);
+            uint idx = (idx3.x << 2) | (idx3.y << 1) | (idx3.z << 0);
+            id = id * 8 + idx + 1;
+            s >>= 1;
+            c = c + idx3 * s - (1 - idx3) * s;
+        }
+        return id;
     }
 
     float4 solve_qef(octree_node_t node) {
@@ -88,6 +102,33 @@ common: [[
 
         float residual = mul(x, mul(A, x)) - 2.0 * mul(x, b) + node.bc.w;
         return float4(x, abs(residual));
+    }
+
+    void add_cell(RWByteAddressBuffer octree, RWByteAddressBuffer collapsed_octree, RWByteAddressBuffer vertices, RWByteAddressBuffer region_info, uint3 cell, octree_node_t node, float4 v[2][2][2]) {
+        uint id = cell_octree_id(cell);
+        store_node(octree, id, node);
+
+        uint corner_signs = (node.corner_signs_vertex_id & 0xFF0000) >> 16;
+        store_parent_corner_sign(octree, id, corner_signs);
+
+        float4 qef_result = solve_qef(node);
+        uint vertex_id = node.corner_signs_vertex_id & 0xFFFF;
+        store_vertex(vertices, region_info, qef_result.xyz, vertex_id, v);
+
+        uint collapsed_mask = 0;
+        collapsed_mask |= vertex_id << 16;
+        collapsed_mask |= corner_signs << 8;
+        collapsed_octree.Store(id * 4, collapsed_mask);
+
+        uint old_mask = 0;
+        while (id && !old_mask) {
+            id -= 1;
+            uint mask_in_parent = (1u << (id & 7));
+            id = id >> 3;
+
+            uint parent_offset = OCTREE_NODE_SIZE * id;
+            octree.InterlockedOr(parent_offset, mask_in_parent, old_mask);
+        }
     }
 
     #define OCTREE_AXIS_Z 0
@@ -213,7 +254,7 @@ common: [[
                     uint sign0 = (edge[ed][minimal_cell].y & (1u << sign_position)) >> sign_position;
                     sign0 *= 2;
                     [branch]
-                    if (sign0 != sign1) {
+                    if (sign0 != sign1 || true) {
                         uint v[4] = {
                             (edge[ed][0].y & 0xFFFF0000) >> 16,
                             (edge[ed][1].y & 0xFFFF0000) >> 16,
@@ -847,6 +888,7 @@ common: [[
                 | load_is_critical_cube(child_signs[6])
                 | load_is_critical_cube(child_signs[7])
                 ;
+            [branch]
             if (any_child_critical)
                 return false;
         }
@@ -861,6 +903,7 @@ common: [[
                 uint s1 = (signs & (1u << e1)) >> e1; \
                 uint s2 = (signs & (1u << e2)) >> e2; \
                 uint c = (child_signs[e1] & (1u << e2)) >> e2; \
+                [branch] \
                 if (s1 != c && s2 != c) \
                     return false; \
             }
@@ -881,238 +924,172 @@ common: [[
                 uint s3 = (signs & (1u << v3)) >> v3; \
                 uint s4 = (signs & (1u << v4)) >> v4; \
                 uint c = (child_signs[v1] & (1u << v4)) >> v4; \
+                [branch] \
                 if (s1 != c && s2 != c && s3 != c && s4 != c) \
                     return false; \
             }
 
         EDGE_CHECK(
-            0u, 0u, 0u,
-            0u, 0u, 1u
+            0, 0, 0,
+            0, 0, 1
         );
         EDGE_CHECK(
-            0u, 1u, 0u,
-            0u, 1u, 1u
+            0, 1, 0,
+            0, 1, 1
         );
         EDGE_CHECK(
-            1u, 0u, 0u,
-            1u, 0u, 1u
+            1, 0, 0,
+            1, 0, 1
         );
         EDGE_CHECK(
-            1u, 1u, 0u,
-            1u, 1u, 1u
+            1, 1, 0,
+            1, 1, 1
         );
 
         EDGE_CHECK(
-            0u, 0u, 0u,
-            0u, 1u, 0u
+            0, 0, 0,
+            0, 1, 0
         );
         EDGE_CHECK(
-            0u, 0u, 1u,
-            0u, 1u, 1u
+            0, 0, 1,
+            0, 1, 1
         );
         EDGE_CHECK(
-            1u, 0u, 0u,
-            1u, 1u, 0u
+            1, 0, 0,
+            1, 1, 0
         );
         EDGE_CHECK(
-            1u, 0u, 1u,
-            1u, 1u, 1u
+            1, 0, 1,
+            1, 1, 1
         );
 
         EDGE_CHECK(
-            0u, 0u, 0u,
-            1u, 0u, 0u
+            0, 0, 0,
+            1, 0, 0
         );
         EDGE_CHECK(
-            0u, 0u, 1u,
-            1u, 0u, 1u
+            0, 0, 1,
+            1, 0, 1
         );
         EDGE_CHECK(
-            0u, 1u, 0u,
-            1u, 1u, 0u
+            0, 1, 0,
+            1, 1, 0
         );
         EDGE_CHECK(
-            0u, 1u, 1u,
-            1u, 1u, 1u
+            0, 1, 1,
+            1, 1, 1
         );
 
         FACE_CHECK(
-            0u, 0u, 0u,
-            1u, 0u, 0u,
-            0u, 1u, 0u,
-            1u, 1u, 0u
+            0, 0, 0,
+            1, 0, 0,
+            0, 1, 0,
+            1, 1, 0
         );
         FACE_CHECK(
-            0u, 0u, 1u,
-            1u, 0u, 1u,
-            0u, 1u, 1u,
-            1u, 1u, 1u
+            0, 0, 1,
+            1, 0, 1,
+            0, 1, 1,
+            1, 1, 1
         );
         FACE_CHECK(
-            0u, 0u, 0u,
-            0u, 0u, 1u,
-            0u, 1u, 0u,
-            0u, 1u, 1u
+            0, 0, 0,
+            0, 0, 1,
+            0, 1, 0,
+            0, 1, 1
         );
         FACE_CHECK(
-            1u, 0u, 0u,
-            1u, 0u, 1u,
-            1u, 1u, 0u,
-            1u, 1u, 1u
+            1, 0, 0,
+            1, 0, 1,
+            1, 1, 0,
+            1, 1, 1
         );
         FACE_CHECK(
-            0u, 0u, 0u,
-            0u, 0u, 1u,
-            1u, 0u, 0u,
-            1u, 0u, 1u
+            0, 0, 0,
+            0, 0, 1,
+            1, 0, 0,
+            1, 0, 1
         );
         FACE_CHECK(
-            0u, 1u, 0u,
-            0u, 1u, 1u,
-            1u, 1u, 0u,
-            1u, 1u, 1u
+            0, 1, 0,
+            0, 1, 1,
+            1, 1, 0,
+            1, 1, 1
         );
 
-        uint middle = child_signs[7] & 1u;
-        if ((signs == 0u && (middle != 0u)) || (signs == 255u && (middle != 1u)))
+        uint middle = child_signs[7] & 1;
+        [branch]
+        if ((signs == 0 && (middle != 0)) || (signs == 255 && (middle != 1)))
             return false;
 
         return true;
     }
 
-    void try_collapse(ByteAddressBuffer octree, uint root_id, float tolerance, ByteAddressBuffer densities, RWByteAddressBuffer collapsed_octree, RWByteAddressBuffer vertices, RWByteAddressBuffer region_info) {
-        // x - index of the current child
-        // y - id
-        // z - number of leaf children
-        // w - total number of children
-        uint4 node_info[OCTREE_DEPTH + 2];
-        uint child_signs[OCTREE_DEPTH + 2][8];
-        octree_node_t nodes[OCTREE_DEPTH + 2];
+    void collapse_one_node(RWByteAddressBuffer octree, uint node_id, uint node_depth, float tolerance, ByteAddressBuffer densities, RWByteAddressBuffer collapsed_octree, RWByteAddressBuffer vertices, RWByteAddressBuffer region_info) {
+        octree_node_t node;
+        node.child_mask = octree.Load(OCTREE_NODE_SIZE * node_id);
+        node.corner_signs_vertex_id = octree.Load(OCTREE_NODE_SIZE * node_id + 28);
+        node.diagA = 0;
+        node.upperA = 0;
+        node.bc = 0;
+        node.edge_sum = 0;
 
-        nodes[1] = load_node(octree, root_id);
-        node_info[1] = uint4(0, root_id, 0, 0);
-        uint cur_depth = 1;
-        while (cur_depth) {
-            [branch]
-            if (node_info[cur_depth].x == 8) {
-                // if all children are leaves, try collapsing
-                // TODO: optimize if this ends up working
-                // TODO: this can actually be computed from child signs
-                #define LOAD_CORNER_DENSITY(corner) (load_density(densities, start * (uint3(1, 1, 1) - corner) + end * corner).w)
-                #define LOAD_SIGN_MASK() \
-                    uint3 start, end; \
-                    get_node_start_end(node_info[cur_depth].y, start, end); \
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 0)), 0)) << 0; \
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 1)), 0)) << 1; \
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 0)), 0)) << 2; \
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 1)), 0)) << 3; \
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 0)), 0)) << 4; \
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 1)), 0)) << 5; \
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 0)), 0)) << 6; \
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 1)), 0)) << 7;
-                //#define LOAD_CORNER_DENSITY(corner) (v[corner.x][corner.y][corner.z].w)
-
-                float3 vertex;
-                uint child_mask = nodes[cur_depth].child_mask & 0xFF;
-                bool is_leaf = false;
-                // TODO: can reduce branching here
-                uint sign_mask = 0;
+        uint collapsed_mask = node.child_mask & 0xFF;
+        uint corner_signs = (node.corner_signs_vertex_id & 0xFF0000) >> 16;
+        uint parent_id = (node_id - 1) >> 3;
+        [branch]
+        if ((node.child_mask & (1u << 31)) == 0) {
+            uint child_signs[8];
+            for (uint i = 0; i < 8; ++i) {
                 [branch]
-                if (node_info[cur_depth].w && node_info[cur_depth].z == node_info[cur_depth].w) {
-                    uint3 start, end;
-                    get_node_start_end(node_info[cur_depth].y, start, end);
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 0)), 0.0)) << 0;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 1)), 0.0)) << 1;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 0)), 0.0)) << 2;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 1)), 0.0)) << 3;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 0)), 0.0)) << 4;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 1)), 0.0)) << 5;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 0)), 0.0)) << 6;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 1)), 0.0)) << 7;
-
-                    for (uint i = 0; i < 8; ++i) {
-                        [branch]
-                        if ((child_mask & (1u << i)) == 0) {
-                            child_signs[cur_depth][i] = (sign_mask & (1u << i)) ? 255 : 0;
-                        }
-                    }
-
-                    [branch]
-                    if (can_collapse(sign_mask, child_signs[cur_depth], cur_depth)) {
-                        float4 qef_result = solve_qef(nodes[cur_depth]);
-                        vertex = qef_result.xyz;
-                        [branch]
-                        if (qef_result.w < tolerance) {
-                            child_mask = 0;
-                            is_leaf = true;
-                        }
-                    }
-                } else [branch] if (!node_info[cur_depth].w) {
-                    uint3 start, end;
-                    get_node_start_end(node_info[cur_depth].y, start, end);
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 0)), 0)) << 0;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 0, 1)), 0)) << 1;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 0)), 0)) << 2;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(0, 1, 1)), 0)) << 3;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 0)), 0)) << 4;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 0, 1)), 0)) << 5;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 0)), 0)) << 6;
-                    sign_mask |= (uint)(step(LOAD_CORNER_DENSITY(uint3(1, 1, 1)), 0)) << 7;
-                    is_leaf = true;
-                    vertex = solve_qef(nodes[cur_depth]).xyz;
-                }
-
-                [branch]
-                if (is_leaf) {
-                    float4 v[2][2][2];
-                    load_cell_densities(densities, (uint3)trunc(clamp(vertex, float3(0, 0, 0), float3(REGION_SIZE, REGION_SIZE, REGION_SIZE))), v);
-
-                    child_mask |= nodes[cur_depth].vertex_id << 16;
-                    child_mask |= sign_mask << 8;
-
-                    float3 wp = vertex - float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN);
-                    float3 wn = normalize(trilerp(v, frac(vertex)));
-                    uint3 vertex_data = uint3(
-                        f32tof16(wp.x) | (f32tof16(wp.y) << 16),
-                        f32tof16(wp.z) | (f32tof16(wn.x) << 16),
-                        f32tof16(wn.y) | (f32tof16(wn.z) << 16)
-                    );
-                    vertices.Store3(nodes[cur_depth].vertex_id * 12, vertex_data);
-                    update_region_bounds(region_info, wp);
-
-                    // if leaf, increment parent's leaf counter and add QEF values
-                    ++node_info[cur_depth - 1].z;
-                    nodes[cur_depth - 1].bc += nodes[cur_depth].bc;
-                    nodes[cur_depth - 1].diagA += nodes[cur_depth].diagA;
-                    nodes[cur_depth - 1].upperA += nodes[cur_depth].upperA;
-                    nodes[cur_depth - 1].edge_sum += nodes[cur_depth].edge_sum;
-                    nodes[cur_depth - 1].vertex_id = nodes[cur_depth].vertex_id;
-                    child_signs[cur_depth - 1][node_info[cur_depth - 1].x - 1] = sign_mask;
+                if ((node.child_mask & (1u << i)) != 0) {
+                    octree_node_t child = load_node(octree, node_id * 8 + i + 1);
+                    node.bc += child.bc;
+                    node.diagA += child.diagA;
+                    node.upperA += child.upperA;
+                    node.edge_sum += child.edge_sum;
+                    node.corner_signs_vertex_id = (node.corner_signs_vertex_id & 0xFF0000) | (child.corner_signs_vertex_id & 0xFFFF);
+                    child_signs[i] = (child.corner_signs_vertex_id & 0xFF0000) >> 16;
                     // add active edge count
                     // TODO: can simply add
-                    nodes[cur_depth - 1].child_mask = (nodes[cur_depth - 1].child_mask & 0xFF) | (((nodes[cur_depth - 1].child_mask >> 8) + (nodes[cur_depth].child_mask >> 8)) << 8);
+                    node.child_mask = (node.child_mask & 0xFF) | ((((node.child_mask & 0x7FFFFF00) >> 8) + ((child.child_mask & 0x7FFFFF00) >> 8)) << 8);
+                } else {
+                    child_signs[i] = (corner_signs & (1u << i)) ? 255 : 0;
                 }
+            }
 
-                collapsed_octree.Store(node_info[cur_depth].y * 4, child_mask);
-                --cur_depth;
-             } else [branch] if (nodes[cur_depth].child_mask & (1u << node_info[cur_depth].x)) {
-                ++node_info[cur_depth].w;
-                ++node_info[cur_depth].x;
-                uint child_id = node_info[cur_depth].y * 8 + node_info[cur_depth].x;
-                nodes[cur_depth + 1] = load_node(octree, child_id);
-                node_info[cur_depth + 1] = uint4(
-                    0,
-                    child_id,
-                    0,
-                    0
-                );
-                ++cur_depth;
-            } else {
-                ++node_info[cur_depth].x;
+            [branch]
+            if (can_collapse(corner_signs, child_signs, node_depth + 1)) {
+                // TODO: no need to solve it, just compute the residue from the sum of vertices
+                float4 qef_result = solve_qef(node);
+                [branch]
+                if (qef_result.w < tolerance) {
+                    node.child_mask = 0;
+
+                    uint vertex_id = node.corner_signs_vertex_id & 0xFFFF;
+                    collapsed_mask = 0;
+                    collapsed_mask |= vertex_id << 16;
+                    collapsed_mask |= corner_signs << 8;
+
+                    float4 v[2][2][2];
+                    float3 clamped_vertex = clamp(qef_result.xyz, float3(0, 0, 0), float3(REGION_SIZE, REGION_SIZE, REGION_SIZE));
+                    load_cell_densities(densities, (uint3)trunc(clamped_vertex), v);
+                    store_vertex(vertices, region_info, qef_result.xyz, vertex_id, v);
+
+                    store_node(octree, node_id, node);
+                }
             }
         }
-    }
 
+        [branch]
+        if (node.child_mask) {
+            octree.InterlockedOr(OCTREE_NODE_SIZE * parent_id, 1u << 31);
+        } else {
+            store_parent_corner_sign(octree, node_id, corner_signs);
+        }
+
+        collapsed_octree.Store(node_id * 4, collapsed_mask);
+    }
 ]]
 
 system : {

@@ -1,6 +1,9 @@
 imports: [
     { name: "densities" type: "buffer" }
     { name: "octree" type: "buffer" uav: true }
+    { name: "collapsed_octree" type: "buffer" uav: true }
+    { name: "vertices" type: "buffer" uav: true }
+    { name: "region_info" type: "buffer" uav: true }
 ]
 
 compile: {
@@ -88,6 +91,12 @@ compute_shader: {
             }
         }
 
+        uint corner_signs = 0;
+        for (uint i = 0; i < 8; ++i) {
+            uint sign_bit = (v[(i & 4) >> 2][(i & 2) >> 1][i & 1].w <= 0.0) ? 1u : 0u;
+            corner_signs |= sign_bit << i;
+        }
+
         [branch]
         if (count > 1) {
             octree_node_t node;
@@ -96,7 +105,7 @@ compute_shader: {
             node.bc = 0;
             node.edge_sum = 0;
             node.child_mask = count << 8;
-            node.vertex_id = cell.x * REGION_SIZE * REGION_SIZE + cell.y * REGION_SIZE + cell.z;
+            node.corner_signs_vertex_id = (corner_signs << 16) | (cell.x * REGION_SIZE * REGION_SIZE + cell.y * REGION_SIZE + cell.z);
 
             float3 cellf = (float3)cell;
 
@@ -113,7 +122,9 @@ compute_shader: {
                 node.edge_sum += p[ip] + cellf;
             }
 
-            add_cell(get_octree(), cell, node);
-        }
+            add_cell(get_octree(), get_collapsed_octree(), get_vertices(), get_region_info(), cell, node, v);
+       } else {
+           store_parent_corner_sign(get_octree(), cell_octree_id(cell), corner_signs);
+       }
     ]]
 }

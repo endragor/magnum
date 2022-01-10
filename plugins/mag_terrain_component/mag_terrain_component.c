@@ -821,7 +821,7 @@ static void activate_octree_system(tm_shader_repository_o *shader_repo, tm_shade
     tm_shader_api->destroy_constant_buffer_instances(io, &cbuf, 1);
 }
 
-static void dc_octree_create(tm_shader_repository_o *shader_repo, const mag_terrain_component_buffers_t *c, const region_data_t *region_data, tm_renderer_handle_t *octree, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
+static void dc_octree_create(tm_shader_repository_o *shader_repo, const mag_terrain_component_buffers_t *c, const region_data_t *region_data, tm_renderer_handle_t *octree, tm_renderer_handle_t *collapsed_octree, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
 {
     TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
 
@@ -829,6 +829,10 @@ static void dc_octree_create(tm_shader_repository_o *shader_repo, const mag_terr
         &(tm_renderer_buffer_desc_t) { .size = OCTREE_NODE_SIZE * octree_node_count(OCTREE_DEPTH), .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV | TM_RENDERER_BUFFER_USAGE_UPDATABLE, .debug_tag = "mag_region_octree" },
         TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
     tm_renderer_api->tm_renderer_resource_command_buffer_api->fill_buffer(res_buf, *octree, 0, OCTREE_NODE_SIZE * octree_node_count(OCTREE_DEPTH - 1), 0, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
+
+    *collapsed_octree = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+        &(tm_renderer_buffer_desc_t) { .size = 4 * octree_node_count(OCTREE_DEPTH), .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_octree_collapsed" },
+        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
 
     tm_shader_resource_binder_instance_t rbinder;
     tm_shader_constant_buffer_instance_t cbuf;
@@ -841,6 +845,9 @@ static void dc_octree_create(tm_shader_repository_o *shader_repo, const mag_terr
 
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("densities", 0x9d97839d5465b483ULL), &c->densities_handle, 0, 0, 1);
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("octree", 0x2a78a6f66423a87fULL), octree, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("collapsed_octree", 0x76cbd4dd06628da3ULL), collapsed_octree, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("vertices", 0x3288dd4327525f9aULL), &c->vertices_handle, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("region_info", 0x5385edbb61c5ae2bULL), &c->region_info_handle, 0, 0, 1);
 
     tm_renderer_shader_info_t shader_info;
     tm_shader_system_context_o *shader_context = tm_shader_system_api->create_context(a, NULL);
@@ -852,6 +859,7 @@ static void dc_octree_create(tm_shader_repository_o *shader_repo, const mag_terr
 
     uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
     tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = *octree, .source_state = state, .destination_state = state }, 1);
+    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = *collapsed_octree, .source_state = state, .destination_state = state }, 1);
     *sort_key += 1;
 
     tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
@@ -860,47 +868,58 @@ static void dc_octree_create(tm_shader_repository_o *shader_repo, const mag_terr
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
 
-static void dc_octree_collapse(tm_shader_repository_o *shader_repo, const mag_terrain_component_buffers_t *c, const region_data_t *region_data, tm_renderer_handle_t octree, tm_renderer_handle_t *collapsed_octree, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
+static void dc_octree_collapse(tm_shader_repository_o *shader_repo, const mag_terrain_component_buffers_t *c, const region_data_t *region_data, tm_renderer_handle_t octree, tm_renderer_handle_t collapsed_octree, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
 {
     TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
 
     init_region_info_buffer(c, res_buf);
 
-    *collapsed_octree = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
-        &(tm_renderer_buffer_desc_t) { .size = 4 * octree_node_count(OCTREE_DEPTH), .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_octree_collapsed" },
-        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
-
     tm_shader_resource_binder_instance_t rbinder;
-    tm_shader_constant_buffer_instance_t cbuf;
 
     tm_shader_o *shader = tm_shader_repository_api->lookup_shader(shader_repo, TM_STATIC_HASH("magnum_octree_collapse", 0xd635c539960e45aeULL));
     tm_shader_io_o *io = tm_shader_api->shader_io(shader);
 
     tm_shader_api->create_resource_binder_instances(io, 1, &rbinder);
-    tm_shader_api->create_constant_buffer_instances(io, 1, &cbuf);
 
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("densities", 0x9d97839d5465b483ULL), &c->densities_handle, 0, 0, 1);
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("octree", 0x2a78a6f66423a87fULL), &octree, 0, 0, 1);
-    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("collapsed_octree", 0x76cbd4dd06628da3ULL), collapsed_octree, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("collapsed_octree", 0x76cbd4dd06628da3ULL), &collapsed_octree, 0, 0, 1);
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("vertices", 0x3288dd4327525f9aULL), &c->vertices_handle, 0, 0, 1);
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("region_info", 0x5385edbb61c5ae2bULL), &c->region_info_handle, 0, 0, 1);
-    set_constant(io, res_buf, &cbuf, TM_STATIC_HASH("root_id", 0xead29d8a46f72288ULL), &(uint32_t) { 0 }, sizeof(uint32_t));
-    set_constant(io, res_buf, &cbuf, TM_STATIC_HASH("tolerance", 0xc500d6c49d9c007aULL), &LODS[region_data->lod].qef_tolerance, sizeof(float));
 
-    tm_renderer_shader_info_t shader_info;
+    uint32_t nodes_on_level = 1;
+    uint32_t last_root_id = 0;
+    for (uint32_t i = 0; i < OCTREE_DEPTH - 2; ++i) {
+        last_root_id = last_root_id * 8 + 1;
+        nodes_on_level *= 8;
+    }
+
+    tm_shader_constant_buffer_instance_t cbufs[OCTREE_DEPTH];
+    tm_shader_api->create_constant_buffer_instances(io, OCTREE_DEPTH, cbufs);
+
     tm_shader_system_context_o *shader_context = tm_shader_system_api->create_context(a, NULL);
     activate_octree_system(shader_repo, shader_context, res_buf);
-    if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, &cbuf, &rbinder, 1, &shader_info)) {
-        tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { 1, 1, 1 } }, &shader_info, 1);
+    for (uint32_t depth = OCTREE_DEPTH - 1; depth > 0; --depth) {
+        set_constant(io, res_buf, cbufs + depth, TM_STATIC_HASH("tolerance", 0xc500d6c49d9c007aULL), &LODS[region_data->lod].qef_tolerance, sizeof(float));
+        set_constant(io, res_buf, cbufs + depth, TM_STATIC_HASH("first_node_id", 0x21e66c5ada72b20bULL), &last_root_id, sizeof(last_root_id));
+        uint32_t parent_depth = depth - 1;
+        set_constant(io, res_buf, cbufs + depth, TM_STATIC_HASH("first_node_depth", 0x7204da62374e7fc2ULL), &parent_depth, sizeof(parent_depth));
+        tm_renderer_shader_info_t shader_info;
+        if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, cbufs + depth, &rbinder, 1, &shader_info)) {
+            tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { nodes_on_level, 1, 1 } }, &shader_info, 1);
+            *sort_key += 1;
+        }
+        nodes_on_level /= 8;
+        last_root_id = (last_root_id - 1) / 8;
+
+        uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
+        tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = collapsed_octree, .source_state = state, .destination_state = state }, 1);
+        tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = octree, .source_state = state, .destination_state = state }, 1);
         *sort_key += 1;
     }
 
-    uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
-    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = *collapsed_octree, .source_state = state, .destination_state = state }, 1);
-    *sort_key += 1;
-
     tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
-    tm_shader_api->destroy_constant_buffer_instances(io, &cbuf, 1);
+    tm_shader_api->destroy_constant_buffer_instances(io, cbufs, OCTREE_DEPTH);
 
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
@@ -947,8 +966,8 @@ static void generate_mesh(tm_shader_repository_o *shader_repo, const mag_terrain
 {
     tm_renderer_handle_t octree;
     tm_renderer_handle_t collapsed_octree;
-    dc_octree_create(shader_repo, c, region_data, &octree, cmd_buf, res_buf, sort_key);
-    dc_octree_collapse(shader_repo, c, region_data, octree, &collapsed_octree, cmd_buf, res_buf, sort_key);
+    dc_octree_create(shader_repo, c, region_data, &octree, &collapsed_octree, cmd_buf, res_buf, sort_key);
+    dc_octree_collapse(shader_repo, c, region_data, octree, collapsed_octree, cmd_buf, res_buf, sort_key);
     dc_octree_contour(shader_repo, c, region_data, collapsed_octree, cmd_buf, res_buf, sort_key);
 
     tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(post_res_buf, octree);
@@ -1542,7 +1561,7 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("region_pos", 0x5af0fcabdb39700fULL), &component->region_data.pos, sizeof(component->region_data.pos));
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("cull_min", 0x7847b0225627923eULL), &component->region_data.cull_min, sizeof(component->region_data.cull_min));
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("cull_max", 0x9cd906a428fb9b7eULL), &component->region_data.cull_max, sizeof(component->region_data.cull_max));
-                set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("entity_id", 0x9cd906a428fb9b7eULL), &entity_id, sizeof(entity_id));
+                set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("entity_id", 0x99b0b65b80bcf53eULL), &entity_id, sizeof(entity_id));
 
                 set_resource(io, args->default_resource_buffer, &rbinders[i], TM_STATIC_HASH("vertices", 0x3288dd4327525f9aULL), &component->buffers->vertices_handle, 0, 0, 1);
                 if (material_count) {
