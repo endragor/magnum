@@ -21,20 +21,12 @@ samplers: {
 		address_u: "wrap"
 		address_v: "wrap"
 		address_w: "wrap"
-		mip_lod_bias: 0
-		anisotropy_enable: true
-		max_anisotropy: 16
-		compare_enable: false
-		compare_op: "less_equal"
-		min_lod: 0
-		max_lod: 16
-		border_color: "float_opaque_white"
 	}
 }
 
 raster_states: {
     polygon_mode: "fill"
-    cull_mode: "none"
+    cull_mode: "back"
     front_face: "ccw"
 }
 
@@ -42,6 +34,10 @@ imports: [
     { name: "cell_size" type: "float" }
     { name: "region_pos" type: "float3" }
     { name: "alpha" type: "float" }
+
+    { name: "cull_min" type: "float3" }
+    { name: "cull_max" type: "float3" }
+    { name: "entity_id" type: "uint2" }
 
     // half-float vertices followed by normals
     { name: "vertices" type: "buffer" }
@@ -54,7 +50,7 @@ imports: [
 ]
 
 common: [[
-    #define TEXTURE_SCALE 0.001
+    #define TEXTURE_SCALE 0.005
 
     float3 blends(float3 wn) {
         float3 blend = pow(abs(wn), 4);
@@ -217,10 +213,15 @@ vertex_shader: {
 
         float4 cp = mul(wp, load_camera_view_projection());
 
-        bool taa_enabled = load_settings_mask() & SETTINGS_TAA_ENABLED;
-        cp = taa_enabled ? add_taa_offset(cp, load_frame_number(), load_render_target_resolution()) : cp;
-        output.position = cp;
+        #if !defined(SHADOW_MAPPING)
+            bool taa_enabled = load_settings_mask() & SETTINGS_TAA_ENABLED;
+            #if defined(DRAW_SELECTION)
+                taa_enabled = false;
+            #endif
+            cp = taa_enabled ? add_taa_offset(cp, load_frame_number(), load_render_target_resolution()) : cp;
+        #endif
 
+        output.position = cp;
         output.wp = wp.xyz;
 
         return output;
@@ -239,39 +240,54 @@ pixel_shader: {
 
         clip(load_alpha() - thresholdMatrix[input.position.x % 4][input.position.y % 4]);
 
-        float3 wn = normalize(input.wn);
+        bool3 should_cull = input.wp >= load_cull_min() && input.wp < load_cull_max();
+        [branch]
+        if (should_cull.x && should_cull.y && should_cull.z) {
+            discard;
+        }
 
-        float3 blend = blends(wn);
-        SamplerState sampler = get_default_sampler();
-        float3 normal = triplanar_normal_whiteout(get_normal_map(0), get_normal_map(1), sampler, input.wp, wn, blend);
-        //blend = blends(normal);
-        //normal = wn;
-        float3 color = triplanar_blend(get_diffuse_map(0), get_diffuse_map(1), sampler, input.wp, blend);
-        float ao = triplanar_blend(get_occlusion_map(0), get_occlusion_map(1), sampler, input.wp, blend).r;
-        float roughness = triplanar_blend(get_roughness_map(0), get_roughness_map(1), sampler, input.wp, blend).r;
-        //normal = magnum_density(input.wp).xyz;
+        #if defined(DRAW_SELECTION)
+            output.selection = (float)(load_entity_id().x & 0xff) / 255.f;
+            return output;
 
-        const float3 dielectric_specular_f0 = float3(0.04, 0.04, 0.04);
-        float metallic = 0.f;
-        //float roughness = 1.0f;
-        //float ao = 1.f;
-        //roughness = 1.f;
-        //ao = 1.f;
+        #elif defined(GBUFFER)
+            #if defined(PICKING_SYSTEM_ENABLED)
+                update_picking_buffers(input.position.xy, load_entity_id(), input.position.z, 1);
+            #endif
 
-        float4 base = 0;
+            float3 wn = normalize(input.wn);
 
-        //base.r = abs(normal.y); // grass
-        //base.g = 1.0 - base.r; // stone
-        //base.b = 0.0;
-        //base.rgb = abs(magnum_density(input.wp).w);
-        base.rgb = color;
-        //base.rgb = 0.8;
-        //base.rgb = load_cell_size() / 64.0;
-        //base.rgb = srgb_to_linear(get_diffuse().Sample(get_default_sampler(), float2(0.5, 0.5)).rgb);
-        float3 spec_f0 = lerp(dielectric_specular_f0, base.rgb, metallic);
-        base.rgb = lerp(base.rgb * (1 - dielectric_specular_f0), float3(0,0,0), metallic);
+            float3 blend = blends(wn);
+            SamplerState sampler = get_default_sampler();
+            float3 normal = triplanar_normal_whiteout(get_normal_map(0), get_normal_map(1), sampler, input.wp, wn, blend);
+            //blend = blends(normal);
+            //normal = wn;
+            //float3 color = triplanar_blend(get_diffuse_map(0), get_diffuse_map(1), sampler, input.wp, blend);
+            //float ao = triplanar_blend(get_occlusion_map(0), get_occlusion_map(1), sampler, input.wp, blend).r;
+            //float roughness = triplanar_blend(get_roughness_map(0), get_roughness_map(1), sampler, input.wp, blend).r;
+            //normal = magnum_density(input.wp).xyz;
 
-        #if defined(GBUFFER)
+            const float3 dielectric_specular_f0 = float3(0.04, 0.04, 0.04);
+            float metallic = 0.f;
+            float roughness = 1.0f;
+            float ao = 1.f;
+            //roughness = 1.f;
+            //ao = 1.f;
+
+            float4 base = 0;
+
+            //base.r = abs(normal.y); // grass
+            //base.g = 1.0 - base.r; // stone
+            //base.b = 0.0;
+            //base.rgb = abs(magnum_density(input.wp).w);
+            //base.rgb = color;
+            base.rgb = 0.8;
+            //base.rgb = wn;
+            //base.rgb = load_cell_size() / 64.0;
+            //base.rgb = srgb_to_linear(get_diffuse().Sample(get_default_sampler(), float2(0.5, 0.5)).rgb);
+            float3 spec_f0 = lerp(dielectric_specular_f0, base.rgb, metallic);
+            base.rgb = lerp(base.rgb * (1 - dielectric_specular_f0), float3(0,0,0), metallic);
+
             #if defined(GBUFFER_AUX)
                 uint surface_mask = TM_SURFACE_PROPERTIES_MASK_ADVANCED_MODE;
             #else
@@ -290,11 +306,44 @@ pixel_shader: {
 
 compile : {
     includes: [ "common", "encoding_decoding", "sampling", "bsdf", "color_spaces", "magnum_common" ]
-    variations : [
-        { systems: ["frame_system", "viewer_system", "shadow_system" ] }
-        { systems: ["frame_system", "viewer_system", "gbuffer_system", "selection_system" ] }
-        { systems: ["frame_system", "viewer_system", "gbuffer_system" ] }
-        { systems: ["frame_system", "viewer_system", "gbuffer_system", "gbuffer_aux_system", "selection_system" ] }
-        { systems: ["frame_system", "viewer_system", "gbuffer_system", "gbuffer_aux_system" ] }
-    ]
+
+    configurations: {
+        shadows: [
+            { systems: ["frame_system", "viewer_system", "shadow_system"]
+                variations: [
+                    { systems: [] }
+                ]
+            }
+        ]
+
+        gbuffer: [
+            { systems: ["frame_system", "viewer_system", "gbuffer_system"]
+                variations: {
+                    compile_variations: [ ["picking_system"], [] ]
+                    variations: [
+                        { systems: [] }
+                    ]
+                }
+            }
+        ]
+
+        gbuffer_advanced: [
+            { systems: ["frame_system", "viewer_system", "gbuffer_system", "gbuffer_aux_system"]
+                variations: [
+                    { systems: [] }
+                ]
+            }
+        ]
+    }
+
+    contexts: {
+        shadow_caster: [
+            { condition: { systems_active: ["shadow_system"] } raster_states: { cull_mode: "front" } configuration: "shadows" }
+        ]
+
+        viewport: [
+            { layer: "gbuffer_advanced" condition: { systems_active: ["gbuffer_aux_system"] } configuration: "gbuffer_advanced" }
+            { layer: "gbuffer" condition: { systems_active: ["gbuffer_system"] } configuration: "gbuffer" }
+        ]
+    }
 }

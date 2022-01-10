@@ -15,7 +15,7 @@ common: [[
 
     float density_bias(float cell_size) {
         //return 0;
-        return -((cell_size * cell_size) - 2.0) * 0.0001;
+        return -((cell_size * cell_size) - 4.0) * 0.005;
     }
 
     // offset for cell corner

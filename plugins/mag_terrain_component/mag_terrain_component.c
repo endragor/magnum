@@ -105,8 +105,8 @@ static const struct
     // { 64.f, 1.f, 15 },
     { 64.f, 2.f, 0.15f, 8, true, true },
     { 128.f, 6.f, 0.15f, 10, true, true },
-    { 256.f, 20.f, 0.5f, 10, true, true },
-    { 2048.f, 40.f, 1.f, 14, true, false },
+    { 256.f, 16.f, 0.3f, 10, true, true },
+    { 2048.f, 40.f, 0.5f, 14, true, false },
     //{ 10000.f, 128.f, 1.f, 20, false },
     //{ 128.f, 10.f / 32.f, 15 },
     // { 256.f, 2.f, 10 },
@@ -1459,9 +1459,6 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
     tm_shader_io_o *io = tm_shader_api->shader_io(shader);
     tm_shader_system_context_o *shader_context = tm_shader_system_api->clone_context(args->shader_context, a);
 
-    tm_render_pipeline_shader_system_t selection_system;
-    args->render_pipeline->api->global_shader_system(args->render_pipeline->inst, TM_RENDER_PIPELINE_EDITOR_SELECTION, &selection_system);
-
     /* carray */ tm_shader_constant_buffer_instance_t *cbufs = 0;
     tm_carray_temp_resize(cbufs, num_renderables, ta);
     tm_shader_api->create_constant_buffer_instances(io, num_renderables, cbufs);
@@ -1517,6 +1514,9 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
             continue;
         }
 
+        const uint32_t entity_idx = entity_indices[i];
+        uint64_t entity_id = entities[entity_idx].u64;
+
         bool updated = false;
         // tm_vec3_t center = region_center(&component->region_data);
         for (uint32_t v = 0; v != num_viewers; ++v) {
@@ -1526,7 +1526,6 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
             tm_shader_system_o *context_system = v == 0 ? gbuffer_system : shadow_system;
             tm_shader_system_api->activate_system(shader_context, context_system, 0, 0, 0, 0);
 
-            const uint32_t entity_idx = entity_indices[i];
             if (!updated) {
                 // tm_mat44_t last_tm;
                 // const tm_transform_t *t = &entity_transforms[entity_idx].world;
@@ -1543,6 +1542,7 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("region_pos", 0x5af0fcabdb39700fULL), &component->region_data.pos, sizeof(component->region_data.pos));
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("cull_min", 0x7847b0225627923eULL), &component->region_data.cull_min, sizeof(component->region_data.cull_min));
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("cull_max", 0x9cd906a428fb9b7eULL), &component->region_data.cull_max, sizeof(component->region_data.cull_max));
+                set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("entity_id", 0x9cd906a428fb9b7eULL), &entity_id, sizeof(entity_id));
 
                 set_resource(io, args->default_resource_buffer, &rbinders[i], TM_STATIC_HASH("vertices", 0x3288dd4327525f9aULL), &component->buffers->vertices_handle, 0, 0, 1);
                 if (material_count) {
@@ -1557,15 +1557,7 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
                 updated = true;
             }
 
-            const bool selected = entity_selection_state ? entity_selection_state[entity_idx] : false;
-            if (v == 0 && selected) {
-                tm_shader_system_api->activate_system(shader_context, selection_system.system,
-                    selection_system.constants, selection_system.constants ? 1 : 0,
-                    selection_system.resources, selection_system.resources ? 1 : 0);
-            }
-
-            TM_ASSERT(tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), args->default_resource_buffer, &cbufs[i], &rbinders[i], 1, &shader_infos[num_draws]), tm_error_api->def, "Failed to assemble shader infos");
-
+            tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, viewers[v].visibility_context, args->default_resource_buffer, &cbufs[i], &rbinders[i], 1, &shader_infos[num_draws]);
             draw_calls[num_draws] = (tm_renderer_draw_call_info_t) {
                 .primitive_type = TM_RENDERER_PRIMITIVE_TYPE_TRIANGLE_LIST,
                 .draw_type = TM_RENDERER_DRAW_TYPE_INDEXED,
@@ -1586,9 +1578,6 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
             //sort_keys[num_draws] |= region_depth_sort_key(depth, component->region_data.lod);
             //sort_keys[num_draws] |= ((uint64_t)component->region_data.lod) << TM_RENDER_GRAPH_SORT_INTERNAL_PASS_BITS_START;
             ++num_draws;
-
-            if (v == 0 && selected)
-                tm_shader_system_api->deactivate_system(shader_context, selection_system.system);
 
             tm_shader_system_api->deactivate_system(shader_context, context_system);
             tm_shader_system_api->deactivate_system(shader_context, viewers[v].viewer_system);
