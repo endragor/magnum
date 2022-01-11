@@ -123,8 +123,8 @@ compute_shader: {
             }
 
             add_cell(get_octree(), get_collapsed_octree(), get_vertices(), get_region_info(), cell, node, v);
-       } else {
-           store_parent_corner_sign(get_octree(), cell_octree_id(cell), corner_signs);
-       }
+        } else {
+            store_parent_corner_sign(get_octree(), cell_octree_id(cell), corner_signs);
+        }
     ]]
 }
