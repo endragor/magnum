@@ -93,7 +93,7 @@ compute_shader: {
 
         uint corner_signs = 0;
         for (uint i = 0; i < 8; ++i) {
-            uint sign_bit = (v[(i & 4) >> 2][(i & 2) >> 1][i & 1].w <= 0.0) ? 1u : 0u;
+            uint sign_bit = (v[(i & 4u) >> 2][(i & 2u) >> 1][i & 1u].w < 0.0) ? 1u : 0u;
             corner_signs |= sign_bit << i;
         }
 
@@ -126,7 +126,7 @@ compute_shader: {
         } else {
             uint cell_id = cell_octree_id(cell);
             store_parent_corner_sign(get_octree(), cell_id, corner_signs);
-            get_collapsed_octree().Store(cell_id * 4, 0);
+            get_collapsed_octree().Store(cell_id * 4, corner_signs << 8);
         }
     ]]
 }

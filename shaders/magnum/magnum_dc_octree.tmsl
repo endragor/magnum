@@ -136,32 +136,35 @@ common: [[
     #define OCTREE_AXIS_X 2
 
     void try_add_edge_polygon(ByteAddressBuffer collapsed_octree, uint4 edge, RWByteAddressBuffer triangles, RWByteAddressBuffer index_counter) {
-        uint axis = (edge.x & (3u << 30u)) >> 30u;
+        uint axis = edge.x >> 30u;
         edge.x &= ~(3u << 30u);
 
+        uint4 offsets = edge * 4;
         // node structure: vertex_id 16 bit, edge signs 8 bit, child mask 8 bit
         uint4 nodes = uint4(
-            collapsed_octree.Load(edge.x * 4),
-            collapsed_octree.Load(edge.y * 4),
-            collapsed_octree.Load(edge.z * 4),
-            collapsed_octree.Load(edge.w * 4)
+            collapsed_octree.Load(offsets.x),
+            collapsed_octree.Load(offsets.y),
+            collapsed_octree.Load(offsets.z),
+            collapsed_octree.Load(offsets.w)
         );
 
+        uint4 has_children = nodes & 0xFF;
+        uint4 has_active_edge = nodes & 0xFF00;
         [branch]
-        if (((nodes.x & 0xFF) | (nodes.y & 0xFF) | (nodes.z & 0xFF) | (nodes.w & 0xFF)) != 0
-            || ((nodes.x & 0xFF00) | (nodes.y & 0xFF00) | (nodes.z & 0xFF00) | (nodes.w & 0xFF00)) == 0)
+        if ((has_children.x | has_children.y | has_children.z | has_children.w) != 0
+            || (has_active_edge.x | has_active_edge.y | has_active_edge.z | has_active_edge.w) == 0)
             return;
 
         uint sign_position;
         uint minimal_node;
         [flatten]
-        if (nodes.x & 0xFF00) {
+        if (has_active_edge.x) {
             sign_position = 7; // 1 1 1
             minimal_node = nodes.x;
-        } else [flatten] if (nodes.y & 0xFF00) {
+        } else [flatten] if (has_active_edge.y) {
             sign_position = axis == OCTREE_AXIS_X ? 6 /* 1 1 0 */ : 3 /* 0 1 1 */;
             minimal_node = nodes.y;
-        } else [flatten] if (nodes.z & 0xFF00) {
+        } else [flatten] if (has_active_edge.z) {
             sign_position = axis == OCTREE_AXIS_Y ? 6 /* 1 1 0 */ : 5 /* 1 0 1 */;
             minimal_node = nodes.z;
         } else {
