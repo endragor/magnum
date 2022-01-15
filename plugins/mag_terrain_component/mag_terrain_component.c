@@ -88,6 +88,12 @@ static struct mag_async_gpu_queue_api *mag_async_gpu_queue_api;
 
 #define VERTICES_PER_REGION (6 * 3 * (MAG_VOXEL_REGION_SIZE + 1) * (MAG_VOXEL_REGION_SIZE + 1) * (MAG_VOXEL_REGION_SIZE + 1))
 
+// NOTE: must be kept in sync with magnum_dc_octree.tmsl
+#define OCTREE_DEPTH 5
+#define OCTREE_NODE_SIZE 60
+
+#include "mag_octree_edges.inl"
+
 static const uint32_t is_critical_cube[256] = {
     0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0
 };
@@ -335,6 +341,8 @@ typedef struct mag_terrain_component_manager_o
     op_t *last_empty_check_op;
 
     mag_async_gpu_queue_o *gpu_queue;
+
+    tm_renderer_handle_t precomputed_octree_edges_handle;
 } mag_terrain_component_manager_o;
 
 typedef struct read_mesh_task_data_t
@@ -794,10 +802,6 @@ static void generate_mesh(tm_shader_repository_o *shader_repo, const mag_terrain
 }
 #else
 
-// NOTE: must be kept in sync with magnum_dc_octree.tmsl
-#define OCTREE_DEPTH 5
-#define OCTREE_NODE_SIZE 60
-
 static inline uint32_t octree_node_count(uint32_t depth)
 {
     uint32_t node_count = 1;
@@ -924,31 +928,27 @@ static void dc_octree_collapse(tm_shader_repository_o *shader_repo, const mag_te
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
 
-static void dc_octree_contour(tm_shader_repository_o *shader_repo, const mag_terrain_component_buffers_t *c, const region_data_t *region_data, tm_renderer_handle_t collapsed_octree, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
+static void dc_octree_contour(tm_shader_repository_o *shader_repo, const mag_terrain_component_buffers_t *c, const region_data_t *region_data, tm_renderer_handle_t collapsed_octree, tm_renderer_handle_t precomputed_edges_handle, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
 {
     TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
 
-    tm_renderer_api->tm_renderer_resource_command_buffer_api->fill_buffer(res_buf, c->ibuf, 0, sizeof(uint16_t) * VERTICES_PER_REGION, 0, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
-
     tm_shader_resource_binder_instance_t rbinder;
-    tm_shader_constant_buffer_instance_t cbuf;
 
     tm_shader_o *shader = tm_shader_repository_api->lookup_shader(shader_repo, TM_STATIC_HASH("magnum_octree_contour", 0x20b73a462ae9e28dULL));
     tm_shader_io_o *io = tm_shader_api->shader_io(shader);
 
     tm_shader_api->create_resource_binder_instances(io, 1, &rbinder);
-    tm_shader_api->create_constant_buffer_instances(io, 1, &cbuf);
 
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("collapsed_octree", 0x76cbd4dd06628da3ULL), &collapsed_octree, 0, 0, 1);
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("index_counter", 0x427b9e8a100f05e5ULL), &c->region_info_handle, 0, 0, 1);
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("triangles", 0x72976bf8d13d4449ULL), &c->ibuf, 0, 0, 1);
-    set_constant(io, res_buf, &cbuf, TM_STATIC_HASH("root_id", 0xead29d8a46f72288ULL), &(uint32_t) { 0 }, sizeof(uint32_t));
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("precomputed_edges", 0xe8084bd05a04703dULL), &precomputed_edges_handle, 0, 0, 1);
 
     tm_renderer_shader_info_t shader_info;
     tm_shader_system_context_o *shader_context = tm_shader_system_api->create_context(a, NULL);
     activate_octree_system(shader_repo, shader_context, res_buf);
-    if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, &cbuf, &rbinder, 1, &shader_info)) {
-        tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { 1, 1, 1 } }, &shader_info, 1);
+    if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, NULL, &rbinder, 1, &shader_info)) {
+        tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { OCTREE_EDGE_COUNT / 2, 1, 1 } }, &shader_info, 1);
         *sort_key += 1;
     }
 
@@ -957,18 +957,17 @@ static void dc_octree_contour(tm_shader_repository_o *shader_repo, const mag_ter
     *sort_key += 1;
 
     tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
-    tm_shader_api->destroy_constant_buffer_instances(io, &cbuf, 1);
 
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
 
-static void generate_mesh(tm_shader_repository_o *shader_repo, const mag_terrain_component_buffers_t *c, const region_data_t *region_data, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, tm_renderer_resource_command_buffer_o *post_res_buf, uint64_t *sort_key)
+static void generate_mesh(mag_terrain_component_manager_o *man, const mag_terrain_component_buffers_t *c, const region_data_t *region_data, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, tm_renderer_resource_command_buffer_o *post_res_buf, uint64_t *sort_key)
 {
     tm_renderer_handle_t octree;
     tm_renderer_handle_t collapsed_octree;
-    dc_octree_create(shader_repo, c, region_data, &octree, &collapsed_octree, cmd_buf, res_buf, sort_key);
-    dc_octree_collapse(shader_repo, c, region_data, octree, collapsed_octree, cmd_buf, res_buf, sort_key);
-    dc_octree_contour(shader_repo, c, region_data, collapsed_octree, cmd_buf, res_buf, sort_key);
+    dc_octree_create(man->shader_repo, c, region_data, &octree, &collapsed_octree, cmd_buf, res_buf, sort_key);
+    dc_octree_collapse(man->shader_repo, c, region_data, octree, collapsed_octree, cmd_buf, res_buf, sort_key);
+    dc_octree_contour(man->shader_repo, c, region_data, collapsed_octree, man->precomputed_octree_edges_handle, cmd_buf, res_buf, sort_key);
 
     tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(post_res_buf, octree);
     tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(post_res_buf, collapsed_octree);
@@ -1153,6 +1152,12 @@ static void destroy(tm_component_manager_o *manager)
     tm_hash_free(&man->component_map);
     tm_set_free(&man->empty_regions);
 
+    tm_renderer_resource_command_buffer_o *res_buf;
+    man->backend->create_resource_command_buffers(man->backend->inst, &res_buf, 1);
+    tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, man->precomputed_octree_edges_handle);
+    man->backend->submit_resource_command_buffers(man->backend->inst, &res_buf, 1);
+    man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
+
     tm_entity_context_o *ctx = man->ctx;
     tm_allocator_i a = man->allocator;
     tm_free(&a, man, sizeof(*man));
@@ -1193,6 +1198,18 @@ static void create_mag_terrain_component(tm_entity_context_o *ctx)
     manager->gpu_queue = mag_async_gpu_queue_api->create(&manager->allocator, backend, &params);
     tm_slab_create(&manager->ops, &manager->allocator, 64 * 1024);
     manager->last_empty_check_op = manager->ops;
+
+    tm_renderer_resource_command_buffer_o *res_buf;
+    manager->backend->create_resource_command_buffers(manager->backend->inst, &res_buf, 1);
+
+    uint32_t *edges;
+    manager->precomputed_octree_edges_handle = tm_renderer_api->tm_renderer_resource_command_buffer_api->map_create_buffer(res_buf,
+        &(tm_renderer_buffer_desc_t) { .size = sizeof(OCTREE_EDGES), .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE, .debug_tag = "mag_precomputed_octree_edges" },
+        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, 0, &edges);
+    memcpy(edges, OCTREE_EDGES, sizeof(OCTREE_EDGES));
+
+    manager->backend->submit_resource_command_buffers(manager->backend->inst, &res_buf, 1);
+    manager->backend->destroy_resource_command_buffers(manager->backend->inst, &res_buf, 1);
 
     const tm_component_i component = {
         .name = MAG_TT_TYPE__TERRAIN_COMPONENT,
@@ -1328,18 +1345,18 @@ static void generate_sdf(tm_shader_repository_o *shader_repo, const mag_terrain_
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
 
-static void generate_region_gpu(tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, tm_renderer_resource_command_buffer_o *post_res_buf, uint64_t *sort_key, tm_shader_repository_o *shader_repo, mag_terrain_component_buffers_t *c, const region_data_t *region_data, const op_t *ops, const op_t *last_op)
+static void generate_region_gpu(tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, tm_renderer_resource_command_buffer_o *post_res_buf, uint64_t *sort_key, mag_terrain_component_manager_o *man, mag_terrain_component_buffers_t *c, const region_data_t *region_data, const op_t *ops, const op_t *last_op)
 {
-    generate_sdf(shader_repo, c, region_data, cmd_buf, res_buf, sort_key);
+    generate_sdf(man->shader_repo, c, region_data, cmd_buf, res_buf, sort_key);
     const aabb_t region_aabb = region_aabb_with_margin(region_data);
     for (const op_t *op = ops; op != last_op; op = tm_slab_next(op)) {
         if (!tm_slab_is_valid(op))
             continue;
         const aabb_t aabb = op_aabb(op);
         if (aabb_intersect(&region_aabb, &aabb))
-            apply_op_to_component(shader_repo, c, region_data, op, cmd_buf, res_buf, sort_key);
+            apply_op_to_component(man->shader_repo, c, region_data, op, cmd_buf, res_buf, sort_key);
     }
-    generate_mesh(shader_repo, c, region_data, cmd_buf, res_buf, post_res_buf, sort_key);
+    generate_mesh(man, c, region_data, cmd_buf, res_buf, post_res_buf, sort_key);
 }
 
 // static void dual_contour_cpu(mag_terrain_component_buffers_t *c, mag_terrain_component_manager_o *man, tm_shader_io_o *io, tm_renderer_backend_i *rb)
@@ -1736,7 +1753,7 @@ void generate_region_task(mag_async_gpu_queue_task_args_t *args)
     tm_renderer_api->tm_renderer_command_buffer_api->bind_queue(cmd_buf, sort_key, &bind_info);
     ++sort_key;
 
-    generate_region_gpu(cmd_buf, res_buf, post_res_buf, &sort_key, man->shader_repo, c, &data->region_data, man->ops, data->ops_end);
+    generate_region_gpu(cmd_buf, res_buf, post_res_buf, &sort_key, man, c, &data->region_data, man->ops, data->ops_end);
 
     tm_renderer_api->tm_renderer_command_buffer_api->bind_queue(cmd_buf, UINT64_MAX - 1, &(tm_renderer_queue_bind_t) { .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL });
 
@@ -1880,7 +1897,7 @@ static void generate_physics_task(void *task_data, uint64_t id)
         uint32_t error;
 
         struct tm_physics_shape_cooking_i *physics_cooking = tm_first_implementation(tm_global_api_registry, tm_physics_shape_cooking_i);
-        data->buffer_id = physics_cooking->cook_mesh_raw(&args, buffers, &format, &error);
+        data->buffer_id = physics_cooking->cook_mesh_raw(physics_cooking->inst, &args, buffers, &format, &error);
 
         if (data->buffer_id) {
             uint64_t buf_size;
@@ -2107,7 +2124,7 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
                         }
 
                         if (applied_something) {
-                            generate_mesh(man->shader_repo, c->buffers, &c->region_data, cmd_buf, res_buf, post_res_buf, &sort_key);
+                            generate_mesh(man, c->buffers, &c->region_data, cmd_buf, res_buf, post_res_buf, &sort_key);
                             uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
                             uint32_t region_info_fence = readback_region_info(c->buffers, cmd_buf, state);
                             tm_carray_temp_push(region_info_fences, region_info_fence, ta);

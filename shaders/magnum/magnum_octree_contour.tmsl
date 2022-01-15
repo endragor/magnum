@@ -1,6 +1,6 @@
 imports: [
     { name: "collapsed_octree" type: "buffer" }
-    { name: "root_id" type: "uint" }
+    { name: "precomputed_edges" type: "buffer" }
 
     { name: "index_counter" type: "buffer" uav: true }
     { name: "triangles" type: "buffer" uav: true }
@@ -13,11 +13,17 @@ compile: {
 }
 
 compute_shader: {
+    import_system_semantics: [ "dispatch_thread_id" ]
+
     attributes: {
-        num_threads: [1, 1, 1]
+        num_threads: [1, 2, 1]
     }
 
     code: [[
-        dual_contour_octree(get_collapsed_octree(), load_root_id(), get_triangles(), get_index_counter());
+        uint edge_idx = dispatch_thread_id.x * 2 + dispatch_thread_id.y;
+        uint4 edge = get_precomputed_edges().Load4(edge_idx * 16);
+
+        try_add_edge_polygon(get_collapsed_octree(), edge, get_triangles(), get_index_counter());
+        //dual_contour_octree(get_collapsed_octree(), 0, get_triangles(), get_index_counter());
     ]]
 }

@@ -135,6 +135,174 @@ common: [[
     #define OCTREE_AXIS_Y 1
     #define OCTREE_AXIS_X 2
 
+    void try_add_edge_polygon(ByteAddressBuffer collapsed_octree, uint4 edge, RWByteAddressBuffer triangles, RWByteAddressBuffer index_counter) {
+        uint axis = (edge.x & (3u << 30u)) >> 30u;
+        edge.x &= ~(3u << 30u);
+
+        // node structure: vertex_id 16 bit, edge signs 8 bit, child mask 8 bit
+        uint4 nodes = uint4(
+            collapsed_octree.Load(edge.x * 4),
+            collapsed_octree.Load(edge.y * 4),
+            collapsed_octree.Load(edge.z * 4),
+            collapsed_octree.Load(edge.w * 4)
+        );
+
+        [branch]
+        if (((nodes.x & 0xFF) | (nodes.y & 0xFF) | (nodes.z & 0xFF) | (nodes.w & 0xFF)) != 0
+            || ((nodes.x & 0xFF00) | (nodes.y & 0xFF00) | (nodes.z & 0xFF00) | (nodes.w & 0xFF00)) == 0)
+            return;
+
+        uint sign_position;
+        uint minimal_node;
+        [flatten]
+        if (nodes.x & 0xFF00) {
+            sign_position = 7; // 1 1 1
+            minimal_node = nodes.x;
+        } else [flatten] if (nodes.y & 0xFF00) {
+            sign_position = axis == OCTREE_AXIS_X ? 6 /* 1 1 0 */ : 3 /* 0 1 1 */;
+            minimal_node = nodes.y;
+        } else [flatten] if (nodes.z & 0xFF00) {
+            sign_position = axis == OCTREE_AXIS_Y ? 6 /* 1 1 0 */ : 5 /* 1 0 1 */;
+            minimal_node = nodes.z;
+        } else {
+            sign_position = 1u << axis;
+            minimal_node = nodes.w;
+        }
+
+        bool xy_coarse = !(nodes.x & 0xFF00) || !(nodes.y & 0xFF00);
+
+        sign_position += 8;
+        // either 0 or 2
+        uint sign1 = (minimal_node & (1u << sign_position)) >> (sign_position - 1);
+        sign_position -= (1u << axis);
+        uint sign0 = (minimal_node & (1u << sign_position)) >> sign_position;
+        sign0 *= 2;
+
+        [branch]
+        if (sign0 != sign1) {
+            uint v[4];
+            while ((nodes.x & 0xFF00) == 0) {
+                edge.x = (edge.x - 1) >> 3;
+                nodes.x = collapsed_octree.Load(edge.x * 4);
+            }
+            v[0] = (nodes.x & 0xFFFF0000) >> 16;
+
+            uint v_idx = 0;
+            while (true) {
+                [branch]
+                if (nodes.y & 0xFF00) {
+                    ++v_idx;
+                    v[v_idx] = (nodes.y & 0xFFFF0000) >> 16;
+                    break;
+                } else {
+                    edge.y = (edge.y - 1) >> 3;
+                    [branch]
+                    if (edge.y == edge.x) {
+                        break;
+                    } else {
+                        nodes.y = collapsed_octree.Load(edge.y * 4);
+                    }
+                }
+            }
+
+            while (true) {
+                [branch]
+                if (nodes.z & 0xFF00) {
+                    ++v_idx;
+                    v[v_idx] = (nodes.z & 0xFFFF0000) >> 16;
+                    break;
+                } else {
+                    edge.z = (edge.z - 1) >> 3;
+                    [branch]
+                    if (edge.z == edge.y || edge.z == edge.x) {
+                        break;
+                    } else {
+                        nodes.z = collapsed_octree.Load(edge.z * 4);
+                    }
+                }
+            }
+
+            while (true) {
+                [branch]
+                if (nodes.w & 0xFF00) {
+                    ++v_idx;
+                    v[v_idx] = (nodes.w & 0xFFFF0000) >> 16;
+                    break;
+                } else {
+                    edge.w = (edge.w - 1) >> 3;
+                    [branch]
+                    if (edge.w == edge.z || edge.w == edge.y || edge.w == edge.x) {
+                        break;
+                    } else {
+                        nodes.w = collapsed_octree.Load(edge.w * 4);
+                    }
+                }
+            }
+
+            [branch]
+            if (v_idx == 3) {
+                // quad
+                uint indexes[6];
+                uint swap = axis == OCTREE_AXIS_Z ? sign1 : sign0;
+                indexes[0 + swap] = v[0];
+                indexes[1 + 0000] = v[1];
+                indexes[2 - swap] = v[2];
+
+                indexes[3 + swap] = v[2];
+                indexes[4 + 0000] = v[1];
+                indexes[5 - swap] = v[3];
+
+                uint index_start;
+                index_counter.InterlockedAdd(0, (uint)6, index_start);
+                [branch]
+                if (index_start % 6 == 0) {
+                    uint3 index_data = uint3(
+                        (indexes[0]) | (indexes[1] << 16),
+                        (indexes[2]) | (indexes[3] << 16),
+                        (indexes[4]) | (indexes[5] << 16)
+                    );
+                    triangles.Store3(index_start << 1, index_data);
+                } else {
+                    uint offset = (index_start - 1) * 2;
+                    triangles.InterlockedAnd(offset, 0xFFFF);
+                    triangles.InterlockedOr(offset, indexes[0] << 16);
+                    offset += 4;
+                    triangles.Store2(offset, uint2(
+                        (indexes[1]) | (indexes[2] << 16),
+                        (indexes[3]) | (indexes[4] << 16)
+                    ));
+                    offset += 8;
+                    triangles.InterlockedAnd(offset, 0xFFFF0000);
+                    triangles.InterlockedOr(offset, indexes[5]);
+                }
+            } else {
+                // triangle
+                uint swap = xy_coarse && (axis != OCTREE_AXIS_Z) ? sign1 : sign0;
+                uint indexes[3];
+                indexes[0 + swap] = v[0];
+                indexes[1 + 0000] = v[1];
+                indexes[2 - swap] = v[2];
+
+                uint index_start;
+                index_counter.InterlockedAdd(0, (uint)3, index_start);
+                [branch]
+                if (index_start % 6 == 0) {
+                    uint offset = index_start << 1;
+                    triangles.Store(offset, indexes[0] | (indexes[1] << 16));
+                    offset += 4;
+                    triangles.InterlockedAnd(offset, 0xFFFF0000);
+                    triangles.InterlockedOr(offset, indexes[2]);
+                } else {
+                    uint offset = (index_start - 1) * 2;
+                    triangles.InterlockedAnd(offset, 0xFFFF);
+                    triangles.InterlockedOr(offset, indexes[0] << 16);
+                    offset += 4;
+                    triangles.Store(offset, indexes[1] | (indexes[2] << 16));
+                }
+            }
+        }
+    }
+
     #define OCTREE_CHILD_IDX(x, y, z) (((x) << 2) | ((y) << 1) | (z))
     #define OCTREE_CHILD_ID(parent_id, x, y, z) (((parent_id) << 3) + OCTREE_CHILD_IDX((x), (y), (z)) + 1)
 
@@ -289,9 +457,11 @@ common: [[
                                 uint offset = index_start << 1;
                                 triangles.Store(offset, indexes[0] | (indexes[1] << 16));
                                 offset += 4;
+                                triangles.InterlockedAnd(offset, 0xFFFF0000);
                                 triangles.InterlockedOr(offset, indexes[2]);
                             } else {
                                 uint offset = (index_start - 1) * 2;
+                                triangles.InterlockedAnd(offset, 0xFFFF);
                                 triangles.InterlockedOr(offset, indexes[0] << 16);
                                 offset += 4;
                                 triangles.Store(offset, indexes[1] | (indexes[2] << 16));
@@ -341,6 +511,7 @@ common: [[
                                 triangles.Store3(index_start << 1, index_data);
                             } else {
                                 uint offset = (index_start - 1) * 2;
+                                triangles.InterlockedAnd(offset, 0xFFFF);
                                 triangles.InterlockedOr(offset, indexes[0] << 16);
                                 offset += 4;
                                 triangles.Store2(offset, uint2(
@@ -348,6 +519,7 @@ common: [[
                                     (indexes[3]) | (indexes[4] << 16)
                                 ));
                                 offset += 8;
+                                triangles.InterlockedAnd(offset, 0xFFFF0000);
                                 triangles.InterlockedOr(offset, indexes[5]);
                             }
                         }

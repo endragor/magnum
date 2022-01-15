@@ -124,7 +124,9 @@ compute_shader: {
 
             add_cell(get_octree(), get_collapsed_octree(), get_vertices(), get_region_info(), cell, node, v);
         } else {
-            store_parent_corner_sign(get_octree(), cell_octree_id(cell), corner_signs);
+            uint cell_id = cell_octree_id(cell);
+            store_parent_corner_sign(get_octree(), cell_id, corner_signs);
+            get_collapsed_octree().Store(cell_id * 4, 0);
         }
     ]]
 }
