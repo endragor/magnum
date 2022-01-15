@@ -172,7 +172,7 @@ common: [[
             minimal_node = nodes.w;
         }
 
-        bool xy_coarse = !(nodes.x & 0xFF00) || !(nodes.y & 0xFF00);
+        bool xy_coarse = !(has_active_edge.x && has_active_edge.y);
 
         sign_position += 8;
         // either 0 or 2
@@ -1251,6 +1251,11 @@ common: [[
                     store_vertex(vertices, region_info, qef_result.xyz, vertex_id, v);
 
                     store_node(octree, node_id, node);
+
+                    // delete children
+                    uint first_child_offset = (node_id * 8 + 1) * 4;
+                    collapsed_octree.Store4(first_child_offset, 0);
+                    collapsed_octree.Store4(first_child_offset + 16, 0);
                 }
             }
         }
