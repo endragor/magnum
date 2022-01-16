@@ -184,7 +184,7 @@ common: [[
         [branch]
         if (sign0 != sign1) {
             uint v[4];
-            while ((nodes.x & 0xFF00) == 0) {
+            while ((nodes.x & 0xFF00) == 0 && edge.x != 0) {
                 edge.x = (edge.x - 1) >> 3;
                 nodes.x = collapsed_octree.Load(edge.x * 4);
             }
@@ -200,7 +200,7 @@ common: [[
                 } else {
                     edge.y = (edge.y - 1) >> 3;
                     [branch]
-                    if (edge.y == edge.x) {
+                    if (edge.y == 0 || edge.y == edge.x) {
                         break;
                     } else {
                         nodes.y = collapsed_octree.Load(edge.y * 4);
@@ -217,7 +217,7 @@ common: [[
                 } else {
                     edge.z = (edge.z - 1) >> 3;
                     [branch]
-                    if (edge.z == edge.y || edge.z == edge.x) {
+                    if (edge.z == 0 || edge.z == edge.y || edge.z == edge.x) {
                         break;
                     } else {
                         nodes.z = collapsed_octree.Load(edge.z * 4);
@@ -234,13 +234,17 @@ common: [[
                 } else {
                     edge.w = (edge.w - 1) >> 3;
                     [branch]
-                    if (edge.w == edge.z || edge.w == edge.y || edge.w == edge.x) {
+                    if (edge.w == 0 || edge.w == edge.z || edge.w == edge.y || edge.w == edge.x) {
                         break;
                     } else {
                         nodes.w = collapsed_octree.Load(edge.w * 4);
                     }
                 }
             }
+
+            [branch]
+            if (v_idx < 2 || ((nodes.x | nodes.y | nodes.z | nodes.w) & 0xFF) != 0)
+                return;
 
             [branch]
             if (v_idx == 3) {
