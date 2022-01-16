@@ -37,7 +37,7 @@ static struct mag_terrain_api *mag_terrain_api;
 #include "plugins/mag_terrain_component/mag_terrain_component.h"
 
 #define MAX_OPS_PER_SECOND 5
-#define MAX_SCULPT_DISTANCE 200.0
+#define MAX_SCULPT_DISTANCE 64.0
 
 typedef struct tm_simulation_state_o
 {
@@ -52,6 +52,8 @@ typedef struct tm_simulation_state_o
     tm_entity_t sphere_aim;
     // either sphere aim or box aim
     tm_entity_t sculpt_aim;
+
+    tm_entity_t player;
 
     mag_terrain_component_manager_o *terrain_mgr;
     double last_op_time;
@@ -88,6 +90,9 @@ static void update_render_visibility(tm_simulation_state_o *state, tm_entity_t e
     tm_render_component_api->set_draws_enable(render_comp, visible);
 }
 
+#define SCULPT_RADIUS 2.f
+#define SELF_SCULPT_THRESHOLD 0.5f
+
 static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
 {
     if (!args->ui)
@@ -104,20 +109,26 @@ static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
 
     tm_vec3_t cursor_pos;
     tm_vec3_t cursor_dir;
-    private__cursor_line(camera, uib.input->mouse_pos, args->rect, &cursor_pos, &cursor_dir);
+    private__cursor_line(camera, tm_rect_center(args->rect), args->rect, &cursor_pos, &cursor_dir);
 
     float hit_length;
     bool ray_intersects = mag_terrain_api->cast_ray(state->terrain_mgr, cursor_pos, cursor_dir, MAX_SCULPT_DISTANCE, &hit_length);
-    update_render_visibility(state, state->sculpt_aim, ray_intersects);
+    bool aim_visible = false;
     if (ray_intersects) {
         tm_vec3_t pos = tm_vec3_add(cursor_pos, tm_vec3_mul(cursor_dir, hit_length));
-        if (uib.input->left_mouse_is_down && (args->time - state->last_op_time >= 1.0 / MAX_OPS_PER_SECOND)) {
-            state->last_op_time = args->time;
-            mag_terrain_api->apply_operation(state->terrain_mgr, TERRAIN_OP_UNION, TERRAIN_OP_SPHERE, pos, (tm_vec3_t) { 16, 16, 16 });
+        const tm_vec3_t player_pos = tm_get_position(state->transform_man, state->player);
+        const float min_distance = (SCULPT_RADIUS + SELF_SCULPT_THRESHOLD) * (SCULPT_RADIUS + SELF_SCULPT_THRESHOLD);
+        if (tm_vec3_dist_sqr(pos, player_pos) >= min_distance) {
+            if (uib.input->left_mouse_is_down && (args->time - state->last_op_time >= 1.0 / MAX_OPS_PER_SECOND)) {
+                state->last_op_time = args->time;
+                mag_terrain_api->apply_operation(state->terrain_mgr, TERRAIN_OP_UNION, TERRAIN_OP_SPHERE, pos, (tm_vec3_t) { SCULPT_RADIUS, SCULPT_RADIUS, SCULPT_RADIUS });
+            }
+            aim_visible = true;
+            tm_transform_component_api->set_local_position(state->transform_man, state->sculpt_aim, pos);
+            update_aim_radius(state, state->sculpt_aim, SCULPT_RADIUS);
         }
-        tm_transform_component_api->set_local_position(state->transform_man, state->sculpt_aim, pos);
-        update_aim_radius(state, state->sculpt_aim, 32.f);
     }
+    update_render_visibility(state, state->sculpt_aim, aim_visible);
 }
 
 static tm_simulation_state_o *start(tm_simulation_start_args_t *args)
@@ -146,6 +157,8 @@ static tm_simulation_state_o *start(tm_simulation_start_args_t *args)
 
     state->render_comp_type = tm_entity_api->lookup_component_type(state->entity_ctx, TM_TT_TYPE_HASH__RENDER_COMPONENT);
     state->transform_man = (tm_transform_component_manager_o *)tm_entity_api->component_manager_by_hash(state->entity_ctx, TM_TT_TYPE_HASH__TRANSFORM_COMPONENT);
+
+    state->player = tm_tag_component_api->find_first(tag_mgr, TM_STATIC_HASH("player", 0xafff68de8a0598dfULL));
 
     update_render_visibility(state, state->sculpt_aim, false);
 
