@@ -172,7 +172,7 @@ common: [[
             minimal_node = nodes.w;
         }
 
-        bool xy_coarse = !(has_active_edge.x && has_active_edge.y);
+        bool xy_coarse = !has_active_edge.x && !has_active_edge.y;
 
         sign_position += 8;
         // either 0 or 2
@@ -280,7 +280,7 @@ common: [[
                 }
             } else {
                 // triangle
-                uint swap = xy_coarse && (axis != OCTREE_AXIS_Z) ? sign1 : sign0;
+                uint swap = xy_coarse ^ (axis == OCTREE_AXIS_Z) ? sign1 : sign0;
                 uint indexes[3];
                 indexes[0 + swap] = v[0];
                 indexes[1 + 0000] = v[1];
