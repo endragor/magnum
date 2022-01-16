@@ -1232,31 +1232,29 @@ common: [[
                 }
             }
 
+            // TODO: do we need can_collapse() check? Seems ok without it.
+            // TODO: no need to solve it, just compute the residue from the sum of vertices
+            float4 qef_result = solve_qef(node);
             [branch]
-            if (can_collapse(corner_signs, child_signs, node_depth + 1)) {
-                // TODO: no need to solve it, just compute the residue from the sum of vertices
-                float4 qef_result = solve_qef(node);
-                [branch]
-                if (qef_result.w < tolerance) {
-                    node.child_mask = 0;
+            if (qef_result.w < tolerance) {
+                node.child_mask = 0;
 
-                    uint vertex_id = node.corner_signs_vertex_id & 0xFFFF;
-                    collapsed_mask = 0;
-                    collapsed_mask |= vertex_id << 16;
-                    collapsed_mask |= corner_signs << 8;
+                uint vertex_id = node.corner_signs_vertex_id & 0xFFFF;
+                collapsed_mask = 0;
+                collapsed_mask |= vertex_id << 16;
+                collapsed_mask |= corner_signs << 8;
 
-                    float4 v[2][2][2];
-                    float3 clamped_vertex = clamp(qef_result.xyz, float3(0, 0, 0), float3(REGION_SIZE, REGION_SIZE, REGION_SIZE));
-                    load_cell_densities(densities, (uint3)trunc(clamped_vertex), v);
-                    store_vertex(vertices, region_info, qef_result.xyz, vertex_id, v);
+                float4 v[2][2][2];
+                float3 clamped_vertex = clamp(qef_result.xyz, float3(0, 0, 0), float3(REGION_SIZE, REGION_SIZE, REGION_SIZE));
+                load_cell_densities(densities, (uint3)trunc(clamped_vertex), v);
+                store_vertex(vertices, region_info, qef_result.xyz, vertex_id, v);
 
-                    store_node(octree, node_id, node);
+                store_node(octree, node_id, node);
 
-                    // delete children
-                    uint first_child_offset = (node_id * 8 + 1) * 4;
-                    collapsed_octree.Store4(first_child_offset, 0);
-                    collapsed_octree.Store4(first_child_offset + 16, 0);
-                }
+                // delete children
+                uint first_child_offset = (node_id * 8 + 1) * 4;
+                collapsed_octree.Store4(first_child_offset, 0);
+                collapsed_octree.Store4(first_child_offset + 16, 0);
             }
         }
 
