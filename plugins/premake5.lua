@@ -217,3 +217,11 @@ project "mag_async_gpu_queue"
     language "C++"
     sysincludedirs {".."}
     files {"mag_async_gpu_queue/*.inl", "mag_async_gpu_queue/*.h", "mag_async_gpu_queue/*.c"}
+
+project "mag_player_simulation"
+    location "build/mag_player_simulation"
+    targetname "mag_player_simulation"
+    kind "SharedLib"
+    language "C++"
+    sysincludedirs {".."}
+    files {"mag_player_simulation/*.inl", "mag_player_simulation/*.h", "mag_player_simulation/*.c"}

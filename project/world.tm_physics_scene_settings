@@ -1,0 +1,20 @@
+__type: "tm_physics_scene_settings"
+__uuid: "3bb511d7-cdfb-9058-5dc1-9c3ecfbc4034"
+gravity: {
+	__uuid: "0a736d49-37b4-e432-7165-c22bf01298e9"
+	y: -100
+}
+ccd: false
+bounding_box_min: {
+	__uuid: "3e5b721f-9fc4-bd2a-fcfe-a5378d9f4470"
+	x: -inf
+	y: -500
+	z: -inf
+}
+bounding_box_max: {
+	__uuid: "a8191c3e-1d46-a5e6-f0be-d2ae9c570786"
+	x: inf
+	y: 500
+	z: inf
+}
+__asset_uuid: "cb133df6-de70-628b-e5a4-34e686b7a6a6"

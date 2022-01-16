@@ -1,0 +1,6 @@
+__type: "tm_plugin"
+__uuid: "345d841d-570c-7bf0-d01d-7625943826ed"
+import_on_change: true
+windows_dll_import_path: "C:\\Users\\endra\\Work\\magnum\\plugins\\bin\\Debug\\mag_player_simulation.dll"
+windows_dll: "b22cd9376e730882"
+__asset_uuid: "bfe8bbc2-54a3-19a1-bd4d-ddc34821acc3"

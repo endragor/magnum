@@ -1,0 +1,6 @@
+__type: "tm_physics_material"
+__uuid: "e3af52cb-f2cb-c551-92d4-ec2982bb9a53"
+static_friction: 0.05000000074505806
+dynamic_friction: 0.05000000074505806
+restitution: 0.4000000059604645
+__asset_uuid: "157f894b-8d96-3be8-587e-67091a08c82f"

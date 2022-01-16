@@ -23,13 +23,13 @@ components: [
 				__uuid: "d82a0763-fa42-8e7b-e351-cd9412480d85"
 				nodes: [
 					{
-						__uuid: "6c3ae169-1dda-738d-c08f-2bf1691601e7"
-						type: "lit_output"
-						position_x: -91.38427734375
-						position_y: -226.75
+						__uuid: "8b63512d-f5b7-6c0f-5f8f-de1a1c363791"
+						type: "unlit_output"
+						position_x: -92.04990386962891
+						position_y: -103.3885040283203
 						settings: {
 							__type: "tm_shader_system_compiled_result"
-							__uuid: "affe4cad-9cb7-8604-d9fc-335367670e46"
+							__uuid: "a5e7540d-9358-5d38-4ec9-a6c3555fd490"
 						}
 					}
 					{
@@ -47,14 +47,20 @@ components: [
 					{
 						__uuid: "926754e4-e7b2-8852-92cf-5f2ebc3597b3"
 						type: "shader_constant"
-						position_x: -434.6476440429688
-						position_y: -99.02166748046875
+						position_x: -417.9093627929688
+						position_y: -105.2985153198242
 					}
 					{
 						__uuid: "992b8ef8-4dd5-19ec-d2d3-842131541236"
 						type: "tm_input_node"
 						position_x: -383.922607421875
 						position_y: 247.5613708496094
+					}
+					{
+						__uuid: "b1bc7165-48c9-ba87-606c-c83030141080"
+						type: "shader_constant"
+						position_x: -421.8847045898438
+						position_y: 79.03636169433594
 					}
 				]
 				connections: [
@@ -66,25 +72,32 @@ components: [
 						to_connector_hash: "31a9dec4d565e3b4"
 					}
 					{
-						__uuid: "4be54316-c5ac-0947-b5f9-4b84c01a349c"
-						from_node: "6c3ae169-1dda-738d-c08f-2bf1691601e7"
-						to_node: "9c0283a4-f5ff-0ff1-1f78-5b3e5fb34277"
-						from_connector_hash: "2be49fca20727525"
-						to_connector_hash: "2be49fca20727525"
-					}
-					{
-						__uuid: "b780e442-0c6f-2d11-f63f-f1258330d32b"
-						from_node: "926754e4-e7b2-8852-92cf-5f2ebc3597b3"
-						to_node: "6c3ae169-1dda-738d-c08f-2bf1691601e7"
-						from_connector_hash: "920b430f38928dc9"
-						to_connector_hash: "2bbe599c6c8fe881"
-					}
-					{
 						__uuid: "0d6df9c6-7793-f5f5-0106-99e1f773dce6"
 						from_node: "992b8ef8-4dd5-19ec-d2d3-842131541236"
 						to_node: "c1d1de46-0810-69eb-9d72-fb393469d76b"
 						from_connector_hash: "d7cc3e5e3e3c6a60"
 						to_connector_hash: "197aa554763f64b0"
+					}
+					{
+						__uuid: "665dbcdf-7006-4141-5f80-393f1de1b6b9"
+						from_node: "926754e4-e7b2-8852-92cf-5f2ebc3597b3"
+						to_node: "8b63512d-f5b7-6c0f-5f8f-de1a1c363791"
+						from_connector_hash: "920b430f38928dc9"
+						to_connector_hash: "2bbe599c6c8fe881"
+					}
+					{
+						__uuid: "f48b873f-78b0-c469-f6a3-0aa6f9e42888"
+						from_node: "8b63512d-f5b7-6c0f-5f8f-de1a1c363791"
+						to_node: "9c0283a4-f5ff-0ff1-1f78-5b3e5fb34277"
+						from_connector_hash: "2be49fca20727525"
+						to_connector_hash: "2be49fca20727525"
+					}
+					{
+						__uuid: "9ab6202d-44cf-20d0-2d22-f1f9c73e2092"
+						from_node: "b1bc7165-48c9-ba87-606c-c83030141080"
+						to_node: "8b63512d-f5b7-6c0f-5f8f-de1a1c363791"
+						from_connector_hash: "920b430f38928dc9"
+						to_connector_hash: "7dedf79780bcd5c1"
 					}
 				]
 				data: [
@@ -139,7 +152,7 @@ components: [
 							value: {
 								__type: "tm_float"
 								__uuid: "8a0c909e-6e49-6264-89fc-27afdcc953e5"
-								float: 0.800000011920929
+								float: 0.300000011920929
 							}
 						}
 					}
@@ -158,6 +171,20 @@ components: [
 							]
 						}
 					}
+					{
+						__uuid: "eb0a2590-26d4-ce20-1226-da1d21a1f60d"
+						to_node: "b1bc7165-48c9-ba87-606c-c83030141080"
+						to_connector_hash: "6bb47b51ae4a21ff"
+						data: {
+							__type: "tm_shader_system_constant_node_settings"
+							__uuid: "3203a5cb-0366-1b63-4092-25160315aa6d"
+							value_type_hash: "6d0a4e744c45523b"
+							value: {
+								__type: "tm_float"
+								__uuid: "dfe1102d-26ed-55f6-b7e3-1c9d49d4d88d"
+							}
+						}
+					}
 				]
 				interface: {
 					__uuid: "573b8742-9dc7-1ace-f333-85bde0f36a09"
@@ -172,7 +199,7 @@ components: [
 							value: {
 								__type: "tm_float"
 								__uuid: "8c727801-c2e3-66c3-be25-c0b0683fb760"
-								float: 8
+								float: 2
 							}
 							public: true
 							order: 1
@@ -181,14 +208,14 @@ components: [
 					last_id: 1
 					cached_node_result: [
 						{
-							__uuid: "b5815804-98a6-0fc8-15dc-7cbf29652b4e"
-							node: "6c3ae169-1dda-738d-c08f-2bf1691601e7"
-							validity_hash: "726cd935f03c5fa2"
+							__uuid: "2e6391a2-be9c-0974-7d56-e4a0f6506e97"
+							node: "8b63512d-f5b7-6c0f-5f8f-de1a1c363791"
+							validity_hash: "911dd198a4ac136b"
 							object: {
 								__type: "tm_shader_system_compiled_result"
-								__uuid: "e64bff79-dc59-ec17-e446-d771490557d8"
-								name: "726cd935f03c5fa2"
-								buffer: "46a44e139d812b85"
+								__uuid: "920056c6-39e1-fe95-1230-220e58178ef6"
+								name: "911dd198a4ac136b"
+								buffer: "16a0038c27fc944d"
 							}
 						}
 					]
