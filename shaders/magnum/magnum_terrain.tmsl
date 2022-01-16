@@ -34,6 +34,8 @@ imports: [
     { name: "cell_size" type: "float" }
     { name: "region_pos" type: "float3" }
     { name: "alpha" type: "float" }
+    { name: "camera_pos" type: "float3" }
+    { name: "depth_bias" type: "float" }
 
     { name: "cull_min" type: "float3" }
     { name: "cull_max" type: "float3" }
@@ -50,7 +52,7 @@ imports: [
 ]
 
 common: [[
-    #define TEXTURE_SCALE 0.005
+    #define TEXTURE_SCALE 0.02
 
     float3 blends(float3 wn) {
         float3 blend = pow(abs(wn), 4);
@@ -203,6 +205,9 @@ vertex_shader: {
             f16tof32((v.x & 0xFFFF0000) >> 16),
             f16tof32((v.y & 0xFFFF))
         ) * load_cell_size();
+        float3 dir = normalize(wp3 - load_camera_pos());
+        wp3 += dir * load_depth_bias();
+
         float4 wp = float4(wp3, 1);
 
         output.wn = float3(

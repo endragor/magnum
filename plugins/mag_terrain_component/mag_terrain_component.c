@@ -82,7 +82,7 @@ static struct mag_async_gpu_queue_api *mag_async_gpu_queue_api;
 #include "plugins/mag_async_gpu_queue/mag_async_gpu_queue.h"
 #include "plugins/mag_voxel/mag_voxel.h"
 
-#define MAX_SIMULTANEOUS_GPU_TASKS 10
+#define MAX_SIMULTANEOUS_GPU_TASKS 20
 #define ALPHA_SPEED 3.0f
 #define MAX_EXTRA_REGIONS 100
 
@@ -103,16 +103,20 @@ static const struct
     float distance;
     float size;
     float qef_tolerance;
+    // must be 0 for LODs with physics, otherwise physics won't match visuals
+    float visual_depth_bias;
     // bits enough to fit ceil((distance + CHUNK_SIZE * size))
-    uint32_t bits;
+    uint16_t bits;
     bool needs_physics;
     bool needs_sculpting;
 } LODS[] = {
     // { 64.f, 1.f, 15 },
-    { 64.f, 2.f, 0.15f, 8, true, true },
-    { 128.f, 6.f, 0.15f, 10, true, true },
-    { 256.f, 16.f, 0.3f, 10, true, true },
-    { 2048.f, 40.f, 0.5f, 14, true, false },
+    { 32.f, 1.f, 0.15f, 0.f, 8, true, true },
+    // { 64.f, 2.f, 0.15f, 10, true, true },
+    { 128.f, 4.f, 0.5, 0.f, 10, true, true },
+    { 256.f, 8.f, 1.0, 0.f, 10, false, false },
+    { 1024.f, 32.f, 1.5f, 3.f, 14, false, false },
+    { 4096.f, 128.f, 1.5f, 6.f, 14, false, false },
     //{ 10000.f, 128.f, 1.f, 20, false },
     //{ 128.f, 10.f / 32.f, 15 },
     // { 256.f, 2.f, 10 },
@@ -1579,6 +1583,8 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("cull_min", 0x7847b0225627923eULL), &component->region_data.cull_min, sizeof(component->region_data.cull_min));
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("cull_max", 0x9cd906a428fb9b7eULL), &component->region_data.cull_max, sizeof(component->region_data.cull_max));
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("entity_id", 0x99b0b65b80bcf53eULL), &entity_id, sizeof(entity_id));
+                set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("camera_pos", 0x75053e0e1e09e303ULL), &viewer_positions[0], sizeof(viewer_positions[0]));
+                set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("depth_bias", 0x2567cfb7f80a5520ULL), &LODS[component->region_data.lod].visual_depth_bias, sizeof(LODS[component->region_data.lod].visual_depth_bias));
 
                 set_resource(io, args->default_resource_buffer, &rbinders[i], TM_STATIC_HASH("vertices", 0x3288dd4327525f9aULL), &component->buffers->vertices_handle, 0, 0, 1);
                 if (material_count) {
@@ -1604,14 +1610,15 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
                 .index_buffer = component->buffers->ibuf,
             };
 
-            // TODO: also consider lods
-            // float camera_distance = tm_vec3_dist(center, viewer_positions[0]);
-            // float lod_size = LODS[component->region_data.lod].size * (float)MAG_VOXEL_CHUNK_SIZE;
-            //uint16_t depth = (uint16_t)floorf((camera_distance + lod_size / 2.f) / lod_size * 100.f);
+            float lod_size = LODS[component->region_data.lod].size * (float)MAG_VOXEL_CHUNK_SIZE;
+            tm_vec3_t half_size = { lod_size / 2.f, lod_size / 2.f, lod_size / 2.f };
+            tm_vec3_t center = tm_vec3_add(component->region_data.pos, half_size);
+            float camera_distance = tm_vec3_dist(center, viewer_positions[0]);
+            uint16_t depth = (uint16_t)floorf((camera_distance + lod_size / 2.f) / lod_size * 100.f);
             //camera_distance /= viewers[0].camera->settings.far_plane;
             //camera_distance = tm_clamp(camera_distance, 0.f, 1.f);
             sort_keys[num_draws] = viewers[v].sort_key | (v == 0 ? gbuffer_sort_key : shadows_sort_key);
-            //sort_keys[num_draws] |= region_depth_sort_key(depth, component->region_data.lod);
+            sort_keys[num_draws] |= region_depth_sort_key(depth, component->region_data.lod);
             //sort_keys[num_draws] |= ((uint64_t)component->region_data.lod) << TM_RENDER_GRAPH_SORT_INTERNAL_PASS_BITS_START;
             ++num_draws;
 
@@ -1928,6 +1935,12 @@ static inline void free_physics_data_arrays(mag_terrain_component_manager_o *man
 
 static void start_physics_task(mag_terrain_component_manager_o *man, mag_terrain_component_t *c)
 {
+#if 0
+    tm_carray_free(c->buffers->indices, &man->allocator);
+    tm_carray_free(c->buffers->vertices, &man->allocator);
+    c->buffers->indices = 0;
+    c->buffers->vertices = 0;
+#else
     uint64_t cur_task_id;
     TM_OS_ENTER_CRITICAL_SECTION(&c->physics_data->cs);
     free_physics_data_arrays(man, c->physics_data);
@@ -1942,6 +1955,7 @@ static void start_physics_task(mag_terrain_component_manager_o *man, mag_terrain
 
     if (cur_task_id)
         tm_task_system_api->cancel_task(cur_task_id);
+#endif
 }
 
 static void remove_physics_components(mag_terrain_component_manager_o *man, mag_terrain_component_t *c, tm_entity_t entity, struct tm_entity_commands_o *commands)
@@ -2235,6 +2249,9 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
         ++active_task_count;
     }
 
+    // if (tm_carray_size(region_info_fences) || tm_carray_size(physics_update_fences))
+    //     TM_LOG("Region updates: %llu; physics updates: %llu", tm_carray_size(region_info_fences), tm_carray_size(physics_update_fences));
+
     for (uint32_t *region_info_fence = region_info_fences; region_info_fence != tm_carray_end(region_info_fences); ++region_info_fence) {
         while (!man->backend->read_complete(man->backend->inst, *region_info_fence, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL))
             ;
@@ -2261,15 +2278,12 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
 
     for (physics_update_fences_t *update_info = physics_update_fences; update_info != tm_carray_end(physics_update_fences); ++update_info) {
         mag_terrain_component_t *c = update_info->c;
-        // we could do update_physics_component right here, but there is a bug with commands
-        // not supporting removing and then adding component of the same type
         remove_physics_components(man, c, update_info->entity, commands);
-        if (c->buffers->region_info.num_indices) {
+        if (c->physics_data->current_task_id) {
             while (!tm_task_system_api->is_task_done_else_assist(c->physics_data->current_task_id))
                 ;
-            //c->physics_data->current_task_id = 0;
-            //update_info->c->physics_data->current_task_id = 0;
-            //update_physics_component(man, update_info->c, update_info->entity, commands);
+            c->physics_data->current_task_id = 0;
+            update_physics_component(man, update_info->c, update_info->entity, commands);
         }
     }
 
