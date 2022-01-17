@@ -84,10 +84,12 @@ static struct mag_async_gpu_queue_api *mag_async_gpu_queue_api;
 
 #define MAX_ASYNC_GPU_TASKS 10
 // TODO: compute this
-#define MAX_REGIONS_PER_OP 16
+#define MAX_REGIONS_PER_OP 30
 #define MAX_TASK_BUFFERS (MAX_ASYNC_GPU_TASKS + MAX_REGIONS_PER_OP)
 #define ALPHA_SPEED 3.0f
 #define MAX_EXTRA_REGIONS 100
+
+#define MAX_SCULPT_DISTANCE 65.f
 
 // NOTE: must be kept in sync with magnum_dc_octree.tmsl
 #define OCTREE_DEPTH 5
@@ -114,15 +116,16 @@ static const struct
     // bits enough to fit ceil((distance + CHUNK_SIZE * size))
     uint16_t bits;
     bool needs_physics;
-    bool needs_sculpting;
 } LODS[] = {
     // { 64.f, 1.f, 15 },
-    { 32.f, 1.f, 0.15f, 0.f, 8, true, true },
+    { 64.f, 1.f, 0.15f, 0.f, 7, true },
+    { 128.f, 1.5f, 0.15f, 0.f, 8, true },
+    // { 128.f, 2.f, 0.15f, 0.f, 10, true },
     // { 64.f, 2.f, 0.15f, 10, true, true },
-    { 128.f, 4.f, 0.5, 0.f, 10, true, true },
-    { 256.f, 8.f, 1.0, 0.f, 10, false, false },
-    { 1024.f, 32.f, 1.5f, 3.f, 14, false, false },
-    { 4096.f, 128.f, 1.5f, 6.f, 14, false, false },
+    { 256.f, 4.f, 0.15f, 0.f, 10, true },
+    // { 512.f, 16.f, 0.15f, 0.f, 12, true },
+    // { 2048.f, 32.f, 0.15f, 3.f, 14, false },
+    // { 10000.f, 128.f, 0.15f, 6.f, 16, false },
     //{ 10000.f, 128.f, 1.f, 20, false },
     //{ 128.f, 10.f / 32.f, 15 },
     // { 256.f, 2.f, 10 },
@@ -136,13 +139,18 @@ typedef struct aabb_t
     tm_vec3_t max;
 } aabb_t;
 
-static float aabb_point_distance(const aabb_t *aabb, const tm_vec3_t *p)
+static inline float aabb_point_distance_sqr(const aabb_t *aabb, const tm_vec3_t *p)
 {
     float dx = tm_max(0.f, tm_max(aabb->min.x - p->x, p->x - aabb->max.x));
     float dy = tm_max(0.f, tm_max(aabb->min.y - p->y, p->y - aabb->max.y));
     float dz = tm_max(0.f, tm_max(aabb->min.z - p->z, p->z - aabb->max.z));
 
-    return sqrtf(dx * dx + dy * dy + dz * dz);
+    return (dx * dx + dy * dy + dz * dz);
+}
+
+static inline float aabb_point_distance(const aabb_t *aabb, const tm_vec3_t *p)
+{
+    return sqrtf(aabb_point_distance_sqr(aabb, p));
 }
 
 static inline bool aabb_intersect(const aabb_t *a, const aabb_t *b)
@@ -557,7 +565,7 @@ static uint64_t region_key(tm_vec3_t start, float lod_size, uint64_t lod_i)
 
 typedef struct TM_HASH_T(uint64_t, region_data_t) region_data_map_t;
 
-static void add_regions_from_aabb(const aabb_t *aabb, uint8_t lod_i, const tm_vec3_t *exclude_min, const tm_vec3_t *exclude_max, const tm_vec3_t *cull_min, const tm_vec3_t *cull_max, region_data_map_t *out_regions)
+static void add_regions_from_aabb(const aabb_t *aabb, uint8_t lod_i, const tm_vec3_t *exclude_min, const tm_vec3_t *exclude_max, float prev_lod_size, region_data_map_t *out_regions)
 {
     float cell_size = LODS[lod_i].size;
     float lod_size = (float)MAG_VOXEL_CHUNK_SIZE * cell_size;
@@ -565,14 +573,17 @@ static void add_regions_from_aabb(const aabb_t *aabb, uint8_t lod_i, const tm_ve
         for (float y = aabb->min.y; y < aabb->max.y; y += lod_size) {
             for (float z = aabb->min.z; z < aabb->max.z; z += lod_size) {
                 bool exclude = x >= exclude_min->x && y >= exclude_min->y && z >= exclude_min->z && (x + lod_size) <= exclude_max->x && (y + lod_size) <= exclude_max->y && (z + lod_size) <= exclude_max->z;
-                if (exclude)
+                if (exclude && false)
                     continue;
 
+                tm_vec3_t prev_lod_size_vec = { prev_lod_size * MAG_VOXEL_CHUNK_SIZE, prev_lod_size * MAG_VOXEL_CHUNK_SIZE, prev_lod_size * MAG_VOXEL_CHUNK_SIZE };
+                tm_vec3_t cull_min = tm_vec3_add(*exclude_min, prev_lod_size_vec);
+                tm_vec3_t cull_max = tm_vec3_sub(*exclude_max, prev_lod_size_vec);
                 region_data_t region = {
                     .pos = { x, y, z },
                     .lod = lod_i,
-                    .cull_min = *cull_min,
-                    .cull_max = *cull_max,
+                    .cull_min = cull_min,
+                    .cull_max = cull_max,
                     .key = region_key((tm_vec3_t) { x, y, z }, lod_size, lod_i),
                 };
                 tm_hash_add(out_regions, region.key, region);
@@ -585,9 +596,7 @@ static void wanted_regions(tm_vec3_t camera_pos, region_data_map_t *out_regions)
 {
     tm_vec3_t prev_min = { 0 };
     tm_vec3_t prev_max = { 0 };
-
-    tm_vec3_t prev_prev_min = { 0 };
-    tm_vec3_t prev_prev_max = { 0 };
+    float prev_lod_size = 0.f;
 
     for (uint64_t i = 0; i < TM_ARRAY_COUNT(LODS); ++i) {
         tm_vec3_t lod_distance = { LODS[i].distance, LODS[i].distance, LODS[i].distance };
@@ -614,13 +623,12 @@ static void wanted_regions(tm_vec3_t camera_pos, region_data_map_t *out_regions)
         }
 
         for (uint32_t ai = 0; ai < aabb_count; ++ai) {
-            add_regions_from_aabb(partial_aabbs + ai, (uint8_t)i, &prev_min, &prev_max, &prev_prev_min, &prev_prev_max, out_regions);
+            add_regions_from_aabb(partial_aabbs + ai, (uint8_t)i, &prev_min, &prev_max, prev_lod_size, out_regions);
         }
 
-        prev_prev_min = prev_min;
-        prev_prev_max = prev_max;
         prev_min = lod_min;
         prev_max = lod_max;
+        prev_lod_size = LODS[i].size;
     }
 }
 
@@ -2065,6 +2073,12 @@ static void update_physics_component(mag_terrain_component_manager_o *man, mag_t
     }
 }
 
+static bool needs_sculpting(const region_data_t *region_data, tm_vec3_t camera_pos)
+{
+    const aabb_t region_aabb = region_aabb_with_margin(region_data);
+    return aabb_point_distance_sqr(&region_aabb, &camera_pos) <= MAX_SCULPT_DISTANCE * MAX_SCULPT_DISTANCE;
+}
+
 static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *data, struct tm_entity_commands_o *commands)
 {
     TM_PROFILER_BEGIN_FUNC_SCOPE();
@@ -2103,19 +2117,26 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
                 man->empty_regions.num_used -= 1;
             } else {
                 const aabb_t region_aabb = region_aabb_with_margin(alive_regions.values + idx);
-                bool has_new_operations = false;
-                for (const aabb_t *new_op_aabb = new_op_aabbs; new_op_aabb != tm_carray_end(new_op_aabbs); ++new_op_aabb) {
-                    if (aabb_intersect(&region_aabb, new_op_aabb)) {
-                        // An operation was applied to the region. It's possible it's no longer empty.
-                        has_new_operations = true;
-                        *region_key = TM_HASH_TOMBSTONE;
-                        man->empty_regions.num_used -= 1;
-                        break;
+
+                if (aabb_point_distance_sqr(&region_aabb, &camera_transform->pos) <= MAX_SCULPT_DISTANCE * MAX_SCULPT_DISTANCE) {
+                    // Region can be sculpted. Need to cache densities for faster sculpting.
+                    *region_key = TM_HASH_TOMBSTONE;
+                    man->empty_regions.num_used -= 1;
+                } else {
+                    bool has_new_operations = false;
+                    for (const aabb_t *new_op_aabb = new_op_aabbs; new_op_aabb != tm_carray_end(new_op_aabbs); ++new_op_aabb) {
+                        if (aabb_intersect(&region_aabb, new_op_aabb)) {
+                            // An operation was applied to the region. It's possible it's no longer empty.
+                            has_new_operations = true;
+                            *region_key = TM_HASH_TOMBSTONE;
+                            man->empty_regions.num_used -= 1;
+                            break;
+                        }
                     }
-                }
-                if (!has_new_operations) {
-                    alive_regions.keys[idx] = TM_HASH_TOMBSTONE;
-                    alive_regions.num_used -= 1;
+                    if (!has_new_operations) {
+                        alive_regions.keys[idx] = TM_HASH_TOMBSTONE;
+                        alive_regions.num_used -= 1;
+                    }
                 }
             }
         }
@@ -2183,18 +2204,20 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
             if (existing) {
                 if (c->generate_task_id && mag_async_gpu_queue_api->is_task_done(man->gpu_queue, c->generate_task_id)) {
                     handle_generate_task_completion(man, c, res_buf);
-                    if (!c->buffers->region_info.num_indices && !LODS[c->region_data.lod].needs_sculpting) {
-                        tm_set_add(&man->empty_regions, c->region_data.key);
-                        tm_hash_remove(&man->component_map, c->region_data.key);
-                        tm_carray_temp_push(free_components, c, ta);
-                        c->region_data.key = 0;
-                    } else {
+                    if (c->buffers->region_info.num_indices || needs_sculpting(&c->region_data, camera_transform->pos)) {
                         mag_terrain_component_state_t state = {
                             .buffers = c->buffers,
                         };
                         tm_hash_update(&man->component_map, c->region_data.key, state);
                     }
                     c->color_rgba.w = 0.f;
+                }
+
+                if (!c->generate_task_id && !c->buffers->region_info.num_indices && !needs_sculpting(&c->region_data, camera_transform->pos)) {
+                    tm_set_add(&man->empty_regions, c->region_data.key);
+                    tm_hash_remove(&man->component_map, c->region_data.key);
+                    tm_carray_temp_push(free_components, c, ta);
+                    c->region_data.key = 0;
                 }
 
                 if (c->read_mesh_task_id && mag_async_gpu_queue_api->is_task_done(man->gpu_queue, c->read_mesh_task_id)) {
@@ -2272,6 +2295,7 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
                     RELEASE_BUFFERS(man->read_mesh_task_buffers_locks, c->buffers->read_mesh_task_buffers_id);
                     c->read_mesh_task_id = 0;
                 }
+                // TODO: don't call if this is not actually needed
                 remove_physics_components(man, c, a->entities[i], commands);
                 //if (LODS[c->region_data.lod].needs_physics) {
                 //}
@@ -2633,7 +2657,7 @@ static bool cast_ray(mag_terrain_component_manager_o *man, tm_vec3_t ray_start, 
 
 #endif
 
-void apply_operation(mag_terrain_component_manager_o *man, mag_terrain_op_type_t type, mag_terrain_op_primitive_t primitive, tm_vec3_t pos, tm_vec3_t size)
+static void apply_operation(mag_terrain_component_manager_o *man, mag_terrain_op_type_t type, mag_terrain_op_primitive_t primitive, tm_vec3_t pos, tm_vec3_t size)
 {
     op_t *op = tm_slab_add(man->ops);
     *op = (op_t) {

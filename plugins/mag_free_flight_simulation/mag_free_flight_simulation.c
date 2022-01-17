@@ -37,7 +37,7 @@ static struct mag_terrain_api *mag_terrain_api;
 #include "plugins/mag_terrain_component/mag_terrain_component.h"
 
 #define MAX_OPS_PER_SECOND 5
-#define MAX_SCULPT_DISTANCE 64.0
+#define MAX_SCULPT_DISTANCE 64.f
 
 typedef struct tm_simulation_state_o
 {
@@ -112,7 +112,7 @@ static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
     private__cursor_line(camera, tm_rect_center(args->rect), args->rect, &cursor_pos, &cursor_dir);
 
     float hit_length;
-    bool ray_intersects = mag_terrain_api->cast_ray(state->terrain_mgr, cursor_pos, cursor_dir, MAX_SCULPT_DISTANCE, &hit_length);
+    bool ray_intersects = mag_terrain_api->cast_ray(state->terrain_mgr, cursor_pos, cursor_dir, MAX_SCULPT_DISTANCE - SCULPT_RADIUS, &hit_length);
     bool aim_visible = false;
     if (ray_intersects) {
         tm_vec3_t pos = tm_vec3_add(cursor_pos, tm_vec3_mul(cursor_dir, hit_length));
