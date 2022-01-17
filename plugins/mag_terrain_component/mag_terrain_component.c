@@ -236,8 +236,7 @@ typedef struct mag_terrain_settings_t
     /* carray */ mag_terrain_material_t *materials;
     /* carray */ tm_renderer_handle_t *diffuse_maps;
     /* carray */ tm_renderer_handle_t *normal_maps;
-    /* carray */ tm_renderer_handle_t *roughness_maps;
-    /* carray */ tm_renderer_handle_t *ao_maps;
+    /* carray */ tm_renderer_handle_t *orm_maps;
 } mag_terrain_settings_t;
 
 // see update_region_bounds() in magnum_common.tmsl
@@ -573,7 +572,7 @@ static void add_regions_from_aabb(const aabb_t *aabb, uint8_t lod_i, const tm_ve
         for (float y = aabb->min.y; y < aabb->max.y; y += lod_size) {
             for (float z = aabb->min.z; z < aabb->max.z; z += lod_size) {
                 bool exclude = x >= exclude_min->x && y >= exclude_min->y && z >= exclude_min->z && (x + lod_size) <= exclude_max->x && (y + lod_size) <= exclude_max->y && (z + lod_size) <= exclude_max->z;
-                if (exclude && false)
+                if (exclude)
                     continue;
 
                 tm_vec3_t prev_lod_size_vec = { prev_lod_size * MAG_VOXEL_CHUNK_SIZE, prev_lod_size * MAG_VOXEL_CHUNK_SIZE, prev_lod_size * MAG_VOXEL_CHUNK_SIZE };
@@ -716,15 +715,13 @@ static void free_terrain_settings(mag_terrain_component_manager_o *man, tm_the_t
         }
     }
     tm_carray_free(man->terrain_settings.materials, &man->allocator);
-    tm_carray_free(man->terrain_settings.ao_maps, &man->allocator);
     tm_carray_free(man->terrain_settings.normal_maps, &man->allocator);
     tm_carray_free(man->terrain_settings.diffuse_maps, &man->allocator);
-    tm_carray_free(man->terrain_settings.roughness_maps, &man->allocator);
+    tm_carray_free(man->terrain_settings.orm_maps, &man->allocator);
     man->terrain_settings.materials = NULL;
-    man->terrain_settings.ao_maps = NULL;
     man->terrain_settings.normal_maps = NULL;
     man->terrain_settings.diffuse_maps = NULL;
-    man->terrain_settings.roughness_maps = NULL;
+    man->terrain_settings.orm_maps = NULL;
 }
 
 static inline int compare_double_inv(const void *a, const void *b)
@@ -773,8 +770,7 @@ static bool load_asset(tm_component_manager_o *manager, struct tm_entity_command
         {
             tm_renderer_handle_t diffuse_map;
             tm_renderer_handle_t normal_map;
-            tm_renderer_handle_t ao_map;
-            tm_renderer_handle_t roughness_map;
+            tm_renderer_handle_t orm_map;
             mag_terrain_material_t material;
         } merged_material_t;
         merged_material_t *merged_materials = 0;
@@ -811,10 +807,8 @@ static bool load_asset(tm_component_manager_o *manager, struct tm_entity_command
                     merged_materials[im].diffuse_map = image_data[i].handle;
                 else if (TM_STRHASH_EQUAL(image_data[i].resource_name, TM_STATIC_HASH("normal", 0xcaed6cd644ec6ba7ULL)))
                     merged_materials[im].normal_map = image_data[i].handle;
-                else if (TM_STRHASH_EQUAL(image_data[i].resource_name, TM_STATIC_HASH("ao", 0x212be6ce840161a0ULL)))
-                    merged_materials[im].ao_map = image_data[i].handle;
-                else if (TM_STRHASH_EQUAL(image_data[i].resource_name, TM_STATIC_HASH("roughness", 0xea2298b545b7e617ULL)))
-                    merged_materials[im].roughness_map = image_data[i].handle;
+                else if (TM_STRHASH_EQUAL(image_data[i].resource_name, TM_STATIC_HASH("orm", 0x8655079c80c7ddf9ULL)))
+                    merged_materials[im].orm_map = image_data[i].handle;
             }
         }
         if (merged_materials) {
@@ -823,15 +817,13 @@ static bool load_asset(tm_component_manager_o *manager, struct tm_entity_command
         }
 
         tm_carray_ensure(man->terrain_settings.materials, material_count, &man->allocator);
-        tm_carray_ensure(man->terrain_settings.ao_maps, material_count, &man->allocator);
         tm_carray_ensure(man->terrain_settings.diffuse_maps, material_count, &man->allocator);
-        tm_carray_ensure(man->terrain_settings.roughness_maps, material_count, &man->allocator);
+        tm_carray_ensure(man->terrain_settings.orm_maps, material_count, &man->allocator);
         tm_carray_ensure(man->terrain_settings.normal_maps, material_count, &man->allocator);
         for (merged_material_t *mat = merged_materials; mat != tm_carray_end(merged_materials); ++mat) {
             tm_carray_push(man->terrain_settings.materials, mat->material, &man->allocator);
             tm_carray_push(man->terrain_settings.diffuse_maps, mat->diffuse_map, &man->allocator);
-            tm_carray_push(man->terrain_settings.roughness_maps, mat->roughness_map, &man->allocator);
-            tm_carray_push(man->terrain_settings.ao_maps, mat->ao_map, &man->allocator);
+            tm_carray_push(man->terrain_settings.orm_maps, mat->orm_map, &man->allocator);
             tm_carray_push(man->terrain_settings.normal_maps, mat->normal_map, &man->allocator);
         }
     }
@@ -1694,8 +1686,7 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
                 if (material_count) {
                     set_resource(io, args->default_resource_buffer, &rbinders[i], TM_STATIC_HASH("diffuse_map", 0x3aa8b87edcc9a470ULL), man->terrain_settings.diffuse_maps, aspect_flags, 0, material_count);
                     set_resource(io, args->default_resource_buffer, &rbinders[i], TM_STATIC_HASH("normal_map", 0xf5c97d31c5c8a1e1ULL), man->terrain_settings.normal_maps, 0, 0, material_count);
-                    set_resource(io, args->default_resource_buffer, &rbinders[i], TM_STATIC_HASH("occlusion_map", 0xb4d0a384fd00f07eULL), man->terrain_settings.ao_maps, 0, 0, material_count);
-                    set_resource(io, args->default_resource_buffer, &rbinders[i], TM_STATIC_HASH("roughness_map", 0xc567338d06658773ULL), man->terrain_settings.roughness_maps, 0, 0, material_count);
+                    set_resource(io, args->default_resource_buffer, &rbinders[i], TM_STATIC_HASH("orm_map", 0x6d998fb1680c0e50ULL), man->terrain_settings.orm_maps, 0, 0, material_count);
                 }
                 // set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("region_pos", 0x5af0fcabdb39700fULL), &component->region_data.pos, sizeof(component->region_data.pos));
                 // set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("lod_size", 0xcd4beb10c25059ffULL), &component->region_data.lod_size, sizeof(component->region_data.lod_size));
