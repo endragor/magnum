@@ -39,9 +39,19 @@ compute_shader: {
         primitive_density = sphere_density(pos, load_primitive_position(), load_primitive_size().x);
         primitive_density.w -= density_bias(cell_size);
 
+        uint operation = load_operation();
         [branch]
-        if (primitive_density.w < cur_density) {
-            store_density(densities, dispatch_thread_id, primitive_density);
+        if (operation == 0) {
+            // union
+            [branch]
+            if (primitive_density.w < cur_density) {
+                store_density(densities, dispatch_thread_id, primitive_density);
+            }
+        } else [branch] if (operation == 1) {
+            //subtract
+            if (-primitive_density.w > cur_density) {
+                store_density(densities, dispatch_thread_id, -primitive_density);
+            }
         }
     ]]
 }

@@ -9,6 +9,7 @@ static struct tm_render_component_api *tm_render_component_api;
 static struct tm_transform_component_api *tm_transform_component_api;
 static struct tm_creation_graph_api *tm_creation_graph_api;
 static struct tm_temp_allocator_api *tm_temp_allocator_api;
+static struct tm_input_api* tm_input_api;
 
 static struct mag_terrain_api *mag_terrain_api;
 
@@ -22,6 +23,7 @@ static struct mag_terrain_api *mag_terrain_api;
 #include <foundation/temp_allocator.h>
 #include <foundation/the_truth.h>
 #include <foundation/the_truth_assets.h>
+#include <foundation/input.h>
 
 #include <plugins/creation_graph/creation_graph.h>
 #include <plugins/entity/entity.h>
@@ -39,6 +41,14 @@ static struct mag_terrain_api *mag_terrain_api;
 #define MAX_OPS_PER_SECOND 5
 #define MAX_SCULPT_DISTANCE 64.f
 
+typedef struct input_state_t {
+    tm_vec2_t mouse_delta;
+    bool held_keys[TM_INPUT_KEYBOARD_ITEM_COUNT];
+    bool left_mouse_held;
+    bool left_mouse_pressed;
+    TM_PAD(1);
+} input_state_t;
+
 typedef struct tm_simulation_state_o
 {
     tm_allocator_i *allocator;
@@ -46,6 +56,10 @@ typedef struct tm_simulation_state_o
     tm_entity_context_o *entity_ctx;
     tm_the_truth_o *tt;
     tm_renderer_backend_i *rb;
+
+    // Contains keyboard and mouse input state.
+    input_state_t input;
+    uint64_t processed_events;
 
     tm_component_type_t render_comp_type;
     tm_transform_component_manager_o *transform_man;
@@ -95,6 +109,37 @@ static void update_render_visibility(tm_simulation_state_o *state, tm_entity_t e
 
 static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
 {
+    // Reset per-frame input
+    state->input.mouse_delta.x = state->input.mouse_delta.y = 0;
+    state->input.left_mouse_pressed = false;
+
+    // Read input
+    tm_input_event_t events[32];
+    while (true) {
+        uint64_t n = tm_input_api->events(state->processed_events, events, 32);
+        for (uint64_t i = 0; i < n; ++i) {
+            const tm_input_event_t* e = events + i;
+            if (e->source && e->source->controller_type == TM_INPUT_CONTROLLER_TYPE_MOUSE) {
+                if (e->item_id == TM_INPUT_MOUSE_ITEM_BUTTON_LEFT) {
+                    const bool down = e->data.f.x > 0.5f;
+                    state->input.left_mouse_pressed = down && !state->input.left_mouse_held;
+                    state->input.left_mouse_held = down;
+                } else if (e->item_id == TM_INPUT_MOUSE_ITEM_MOVE) {
+                    state->input.mouse_delta.x += e->data.f.x;
+                    state->input.mouse_delta.y += e->data.f.y;
+                }
+            }
+            if (e->source && e->source->controller_type == TM_INPUT_CONTROLLER_TYPE_KEYBOARD) {
+                if (e->type == TM_INPUT_EVENT_TYPE_DATA_CHANGE) {
+                    state->input.held_keys[e->item_id] = e->data.f.x == 1.0f;
+                }
+            }
+        }
+        state->processed_events += n;
+        if (n < 32)
+            break;
+    }
+
     if (!args->ui)
         return;
 
@@ -119,9 +164,10 @@ static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
         const tm_vec3_t player_pos = tm_get_position(state->transform_man, state->player);
         const float min_distance = (SCULPT_RADIUS + SELF_SCULPT_THRESHOLD) * (SCULPT_RADIUS + SELF_SCULPT_THRESHOLD);
         if (tm_vec3_dist_sqr(pos, player_pos) >= min_distance) {
-            if (uib.input->left_mouse_is_down && (args->time - state->last_op_time >= 1.0 / MAX_OPS_PER_SECOND)) {
+            if (state->input.left_mouse_held && (args->time - state->last_op_time >= 1.0 / MAX_OPS_PER_SECOND)) {
                 state->last_op_time = args->time;
-                mag_terrain_api->apply_operation(state->terrain_mgr, TERRAIN_OP_UNION, TERRAIN_OP_SPHERE, pos, (tm_vec3_t) { SCULPT_RADIUS, SCULPT_RADIUS, SCULPT_RADIUS });
+                mag_terrain_op_type_t op = state->input.held_keys[TM_INPUT_KEYBOARD_ITEM_LEFTSHIFT] ? TERRAIN_OP_SUBTRACT : TERRAIN_OP_UNION;
+                mag_terrain_api->apply_operation(state->terrain_mgr, op, TERRAIN_OP_SPHERE, pos, (tm_vec3_t) { SCULPT_RADIUS, SCULPT_RADIUS, SCULPT_RADIUS });
             }
             aim_visible = true;
             tm_transform_component_api->set_local_position(state->transform_man, state->sculpt_aim, pos);
@@ -192,6 +238,7 @@ TM_DLL_EXPORT void tm_load_plugin(struct tm_api_registry_api *reg, bool load)
     tm_transform_component_api = tm_get_api(reg, tm_transform_component_api);
     tm_creation_graph_api = tm_get_api(reg, tm_creation_graph_api);
     tm_temp_allocator_api = tm_get_api(reg, tm_temp_allocator_api);
+    tm_input_api = tm_get_api(reg, tm_input_api);
 
     mag_terrain_api = tm_get_api(reg, mag_terrain_api);
 
