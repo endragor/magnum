@@ -116,16 +116,22 @@ static const struct
     // bits enough to fit ceil((distance + CHUNK_SIZE * size))
     uint16_t bits;
     bool needs_physics;
+    bool needs_shadows;
 } LODS[] = {
     // { 64.f, 1.f, 15 },
-    { 64.f, 1.f, 0.15f, 0.f, 7, true },
-    { 128.f, 1.5f, 0.15f, 0.f, 8, true },
+    { 128.f, 1.f, 0.15f, 0.f, 7, true, true },
+    { 200.f, 2.f, 0.15f, 0.f, 8, true, false },
     // { 128.f, 2.f, 0.15f, 0.f, 10, true },
     // { 64.f, 2.f, 0.15f, 10, true, true },
-    { 256.f, 4.f, 0.15f, 0.f, 10, true },
+    { 256.f, 4.f, 0.15f, 0.f, 10, true, false },
+    { 512.f, 8.f, 0.15f, 0.f, 10, true, false },
+    { 1024.f, 16.f, 0.15f, 0.f, 10, true, false },
+    { 2048.f, 32.f, 0.15f, 0.f, 10, true, false },
+    { 4096.f, 64.f, 0.15f, 0.f, 10, false, false },
+    { 8192.f, 128.f, 0.15f, 0.f, 10, false, false },
     // { 512.f, 16.f, 0.15f, 0.f, 12, true },
     // { 2048.f, 32.f, 0.15f, 3.f, 14, false },
-    { 10000.f, 128.f, 0.15f, 6.f, 16, false },
+    // { 10000.f, 128.f, 0.15f, 6.f, 16, false },
     //{ 10000.f, 128.f, 1.f, 20, false },
     //{ 128.f, 10.f / 32.f, 15 },
     // { 256.f, 2.f, 10 },
@@ -571,13 +577,13 @@ static void add_regions_from_aabb(const aabb_t *aabb, uint8_t lod_i, const tm_ve
     for (float x = aabb->min.x; x < aabb->max.x; x += lod_size) {
         for (float y = aabb->min.y; y < aabb->max.y; y += lod_size) {
             for (float z = aabb->min.z; z < aabb->max.z; z += lod_size) {
-                bool exclude = x >= exclude_min->x && y >= exclude_min->y && z >= exclude_min->z && (x + lod_size) <= exclude_max->x && (y + lod_size) <= exclude_max->y && (z + lod_size) <= exclude_max->z;
+                tm_vec3_t prev_lod_size_vec = { prev_lod_size * (MAG_VOXEL_CHUNK_SIZE), prev_lod_size * (MAG_VOXEL_CHUNK_SIZE), prev_lod_size * (MAG_VOXEL_CHUNK_SIZE) };
+                tm_vec3_t cull_min = tm_vec3_add(*exclude_min, prev_lod_size_vec);
+                tm_vec3_t cull_max = tm_vec3_sub(*exclude_max, prev_lod_size_vec);
+                bool exclude = x >= cull_min.x && y >= cull_min.y && z >= cull_min.z && (x + lod_size) <= cull_max.x && (y + lod_size) <= cull_max.y && (z + lod_size) <= cull_max.z;
                 if (exclude)
                     continue;
 
-                tm_vec3_t prev_lod_size_vec = { prev_lod_size * MAG_VOXEL_CHUNK_SIZE, prev_lod_size * MAG_VOXEL_CHUNK_SIZE, prev_lod_size * MAG_VOXEL_CHUNK_SIZE };
-                tm_vec3_t cull_min = tm_vec3_add(*exclude_min, prev_lod_size_vec);
-                tm_vec3_t cull_max = tm_vec3_sub(*exclude_max, prev_lod_size_vec);
                 region_data_t region = {
                     .pos = { x, y, z },
                     .lod = lod_i,
@@ -1629,7 +1635,7 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
 
     /* carray */ tm_vec3_t *viewer_positions = 0;
     tm_carray_temp_resize(viewer_positions, num_viewers, ta);
-    for (uint32_t v = 0; v != num_viewers; ++v) {
+    for (uint32_t v = 0; v != 1; ++v) {
         tm_mat44_t view_inverse;
         tm_mat44_inverse(&view_inverse, viewers[v].camera->view);
         viewer_positions[v] = (tm_vec3_t) { view_inverse.wx, view_inverse.wy, view_inverse.wz };
@@ -1655,7 +1661,8 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
 
         bool updated = false;
         // tm_vec3_t center = region_center(&component->region_data);
-        for (uint32_t v = 0; v != num_viewers; ++v) {
+        uint32_t max_viewers = LODS[component->region_data.lod].needs_shadows ? num_viewers : 1;
+        for (uint32_t v = 0; v != max_viewers; ++v) {
             if (!tm_culling_frustum_visible(frustum_visibility, i, v, num_viewers))
                 continue;
             tm_shader_system_api->activate_system(shader_context, viewers[v].viewer_system, viewers[v].viewer_cbuffer, 1, viewers[v].viewer_rbinder, viewers[v].viewer_rbinder ? 1 : 0);

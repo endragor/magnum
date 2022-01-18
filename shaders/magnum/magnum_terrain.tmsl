@@ -252,11 +252,11 @@ pixel_shader: {
 
         clip(load_alpha() - thresholdMatrix[input.position.x % 4][input.position.y % 4]);
 
-        bool3 should_cull = input.wp >= load_cull_min() && input.wp < load_cull_max();
-        [branch]
-        if (should_cull.x && should_cull.y && should_cull.z) {
-            discard;
-        }
+        //bool3 should_cull = load_alpha() == 1.0 && input.wp >= load_cull_min() && input.wp < load_cull_max();
+        //[branch]
+        //if (should_cull.x && should_cull.y && should_cull.z) {
+            //discard;
+        //}
 
         #if defined(DRAW_SELECTION)
             output.selection = (float)(load_entity_id().x & 0xff) / 255.f;
