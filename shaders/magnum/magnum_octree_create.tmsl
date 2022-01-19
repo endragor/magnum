@@ -105,7 +105,7 @@ compute_shader: {
             node.bc = 0;
             node.edge_sum = 0;
             node.child_mask = count << 8;
-            node.corner_signs_vertex_id = (corner_signs << 16) | (cell.x * REGION_SIZE * REGION_SIZE + cell.y * REGION_SIZE + cell.z);
+            node.corner_signs_qef_result_z = corner_signs << 16;
 
             float3 cellf = (float3)cell;
 
@@ -122,11 +122,11 @@ compute_shader: {
                 node.edge_sum += p[ip] + cellf;
             }
 
-            add_cell(get_octree(), get_collapsed_octree(), get_vertices(), get_region_info(), cell, node, v);
+            add_cell(get_octree(), get_collapsed_octree(), get_vertices(), get_region_info(), cell, node);
         } else {
             uint cell_id = cell_octree_id(cell);
             store_parent_corner_sign(get_octree(), cell_id, corner_signs);
-            get_collapsed_octree().Store(cell_id * 4, corner_signs << 8);
+            get_collapsed_octree().Store(cell_id * 4, 0);
         }
     ]]
 }

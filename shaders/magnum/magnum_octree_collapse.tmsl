@@ -31,8 +31,13 @@ compute_shader: {
         collapse_one_node(get_octree(), node_id, parent_depth + 1, load_tolerance(), get_densities(), get_collapsed_octree(), get_vertices(), get_region_info());
 
         [branch]
-        if (parent_depth == 0 && dispatch_thread_id.y == 0) {
-            get_collapsed_octree().Store(0, get_octree().Load(0) & 0xFF);
+        if (parent_depth == 0) {
+            AllMemoryBarrierWithGroupSync();
+            [branch]
+            if (dispatch_thread_id.y == 0) {
+                // collapse root
+                collapse_one_node(get_octree(), 0, 0, load_tolerance(), get_densities(), get_collapsed_octree(), get_vertices(), get_region_info());
+            }
         }
     ]]
 }

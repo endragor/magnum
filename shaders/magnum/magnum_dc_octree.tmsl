@@ -8,7 +8,7 @@ common: [[
 
     #define OCTREE_DEPTH 5
 
-    #define OCTREE_NODE_SIZE 60
+    #define OCTREE_NODE_SIZE 64
     struct octree_node_t {
         float3 diagA;
         float3 upperA;
@@ -16,19 +16,20 @@ common: [[
         float3 edge_sum;
         // lower 8 bit - child mask, upper 24 bits - active edge count
         uint child_mask;
-        // upper 8 bit - corner signs, lower 16 bit - vertex id
-        uint corner_signs_vertex_id;
+        // upper 8 bit - corner signs, lower 16 bit - qef_result.z
+        uint corner_signs_qef_result_z;
+        uint qef_result_xy;
     };
 
     void store_node(RWByteAddressBuffer octree, uint id, octree_node_t node) {
         uint offset = OCTREE_NODE_SIZE * id;
-        octree.Store4(offset, uint4(node.child_mask, asuint(node.diagA)));
+        octree.Store4(offset, uint4(node.child_mask, node.corner_signs_qef_result_z, node.qef_result_xy, asuint(node.bc.w)));
         offset += 4 * 4;
-        octree.Store4(offset, uint4(asuint(node.upperA), node.corner_signs_vertex_id));
+        octree.Store4(offset, uint4(asuint(node.diagA), asuint(node.upperA.x)));
         offset += 4 * 4;
-        octree.Store4(offset, asuint(node.bc));
+        octree.Store4(offset, uint4(asuint(node.upperA.yz), asuint(node.bc.xy)));
         offset += 4 * 4;
-        octree.Store3(offset, asuint(node.edge_sum));
+        octree.Store4(offset, uint4(asuint(node.bc.z), asuint(node.edge_sum)));
     }
 
     octree_node_t load_node(RWByteAddressBuffer octree, uint id) {
@@ -37,40 +38,33 @@ common: [[
         uint offset = OCTREE_NODE_SIZE * id;
         uint4 first = octree.Load4(offset);
         ret.child_mask = first.x;
-        ret.diagA = asfloat(first.yzw);
+        ret.corner_signs_qef_result_z = first.y;
+        ret.qef_result_xy = first.z;
+        ret.bc.w = asfloat(first.w);
 
         offset += 4 * 4;
         uint4 second = octree.Load4(offset);
-        ret.upperA = asfloat(second.xyz);
-        ret.corner_signs_vertex_id = second.w;
+        ret.diagA = asfloat(second.xyz);
+        ret.upperA.x = asfloat(second.w);
 
         offset += 4 * 4;
-        ret.bc = asfloat(octree.Load4(offset));
+        uint4 third = octree.Load4(offset);
+        ret.upperA.yz = asfloat(third.xy);
+        ret.bc.xy = asfloat(third.zw);
 
         offset += 4 * 4;
-        ret.edge_sum = asfloat(octree.Load3(offset));
+        uint4 fourth = octree.Load4(offset);
+        ret.bc.z = asfloat(fourth.x);
+        ret.edge_sum = asfloat(fourth.yzw);
 
         return ret;
-    }
-
-    void store_vertex(RWByteAddressBuffer vertices, RWByteAddressBuffer region_info, float3 qef_vertex, uint vertex_id, float4 v[2][2][2])  {
-        float3 clamped_vertex = clamp(qef_vertex, float3(0, 0, 0), float3(REGION_SIZE, REGION_SIZE, REGION_SIZE));
-        float3 wp = clamped_vertex - float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN);
-        float3 wn = normalize(trilerp(v, frac(clamped_vertex)));
-        uint3 vertex_data = uint3(
-            f32tof16(wp.x) | (f32tof16(wp.y) << 16),
-            f32tof16(wp.z) | (f32tof16(wn.x) << 16),
-            f32tof16(wn.y) | (f32tof16(wn.z) << 16)
-        );
-        vertices.Store3(vertex_id * 12, vertex_data);
-        update_region_bounds(region_info, wp);
     }
 
     void store_parent_corner_sign(RWByteAddressBuffer octree, uint id, uint corner_signs) {
         uint parent_id = (id - 1) >> 3;
         uint id_in_parent = (id - 1) & 7;
         uint sign_bit = corner_signs & (1u << id_in_parent);
-        octree.InterlockedOr(OCTREE_NODE_SIZE * parent_id + 28, sign_bit << 16);
+        octree.InterlockedOr(OCTREE_NODE_SIZE * parent_id + 4, sign_bit << 16);
     }
 
     uint cell_octree_id(uint3 cell) {
@@ -104,21 +98,20 @@ common: [[
         return float4(x, abs(residual));
     }
 
-    void add_cell(RWByteAddressBuffer octree, RWByteAddressBuffer collapsed_octree, RWByteAddressBuffer vertices, RWByteAddressBuffer region_info, uint3 cell, octree_node_t node, float4 v[2][2][2]) {
+    #define ASSIGN_QEF_RESULT(node, qef_result) \
+        node.qef_result_xy = f32tof16(qef_result.x) | (f32tof16(qef_result.y) << 16); \
+        node.corner_signs_qef_result_z |= f32tof16(qef_result.z);
+
+    void add_cell(RWByteAddressBuffer octree, RWByteAddressBuffer collapsed_octree, RWByteAddressBuffer vertices, RWByteAddressBuffer region_info, uint3 cell, octree_node_t node) {
         uint id = cell_octree_id(cell);
+        float4 qef_result = solve_qef(node);
+        ASSIGN_QEF_RESULT(node, qef_result)
         store_node(octree, id, node);
 
-        uint corner_signs = (node.corner_signs_vertex_id & 0xFF0000) >> 16;
+        uint corner_signs = (node.corner_signs_qef_result_z & 0xFF0000) >> 16;
         store_parent_corner_sign(octree, id, corner_signs);
 
-        float4 qef_result = solve_qef(node);
-        uint vertex_id = node.corner_signs_vertex_id & 0xFFFF;
-        store_vertex(vertices, region_info, qef_result.xyz, vertex_id, v);
-
-        uint collapsed_mask = 0;
-        collapsed_mask |= vertex_id << 16;
-        collapsed_mask |= corner_signs << 8;
-        collapsed_octree.Store(id * 4, collapsed_mask);
+        collapsed_octree.Store(id * 4, corner_signs << 8);
 
         uint old_mask = 0;
         while (id && !old_mask) {
@@ -1204,21 +1197,60 @@ common: [[
         return true;
     }
 
+    void store_vertex(RWByteAddressBuffer vertices, RWByteAddressBuffer region_info, float3 clamped_vertex, uint vertex_id, float4 v[2][2][2])  {
+        float3 wp = clamped_vertex - float3(REGION_MARGIN, REGION_MARGIN, REGION_MARGIN);
+        float3 wn = normalize(trilerp(v, frac(clamped_vertex)));
+        uint3 vertex_data = uint3(
+            f32tof16(wp.x) | (f32tof16(wp.y) << 16),
+            f32tof16(wp.z) | (f32tof16(wn.x) << 16),
+            f32tof16(wn.y) | (f32tof16(wn.z) << 16)
+        );
+        vertices.Store3(vertex_id * 12, vertex_data);
+        update_region_bounds(region_info, wp);
+    }
+
+    void assign_child_vertices(uint node_id, uint child_mask, uint2 child_qef_results[8], uint child_count, ByteAddressBuffer densities, RWByteAddressBuffer collapsed_octree, RWByteAddressBuffer vertices, RWByteAddressBuffer region_info) {
+        uint vertex_id;
+        region_info.InterlockedAdd(4, child_count, vertex_id);
+        for (uint i = 0; i < 8; ++i) {
+            [branch]
+            if ((child_mask & (1u << i)) != 0) {
+                uint child_id = node_id * 8 + i + 1;
+                collapsed_octree.InterlockedOr(child_id * 4, vertex_id << 16);
+
+                float3 qef_result = float3(
+                    f16tof32(child_qef_results[i].x & 0xFFFF),
+                    f16tof32((child_qef_results[i].x & 0xFFFF0000) >> 16),
+                    f16tof32(child_qef_results[i].y & 0xFFFF)
+                );
+                float4 v[2][2][2];
+                float3 clamped_vertex = clamp(qef_result, float3(0, 0, 0), float3(REGION_SIZE + 0.9999, REGION_SIZE + 0.9999, REGION_SIZE + 0.9999));
+                load_cell_densities(densities, (uint3)trunc(clamped_vertex), v);
+                store_vertex(vertices, region_info, clamped_vertex, vertex_id, v);
+
+                ++vertex_id;
+            }
+        }
+    }
+
     void collapse_one_node(RWByteAddressBuffer octree, uint node_id, uint node_depth, float tolerance, ByteAddressBuffer densities, RWByteAddressBuffer collapsed_octree, RWByteAddressBuffer vertices, RWByteAddressBuffer region_info) {
         octree_node_t node;
-        node.child_mask = octree.Load(OCTREE_NODE_SIZE * node_id);
-        node.corner_signs_vertex_id = octree.Load(OCTREE_NODE_SIZE * node_id + 28);
+        uint2 first = octree.Load2(OCTREE_NODE_SIZE * node_id);
+        node.child_mask = first.x;
+        node.corner_signs_qef_result_z = first.y;
         node.diagA = 0;
         node.upperA = 0;
         node.bc = 0;
         node.edge_sum = 0;
 
         uint collapsed_mask = node.child_mask & 0xFF;
-        uint corner_signs = (node.corner_signs_vertex_id & 0xFF0000) >> 16;
+        uint corner_signs = (node.corner_signs_qef_result_z & 0xFF0000) >> 16;
         uint parent_id = (node_id - 1) >> 3;
         [branch]
         if ((node.child_mask & (1u << 31)) == 0) {
             uint child_signs[8];
+            uint child_count = 0;
+            uint2 child_qef_results[8];
             for (uint i = 0; i < 8; ++i) {
                 [branch]
                 if ((node.child_mask & (1u << i)) != 0) {
@@ -1227,10 +1259,11 @@ common: [[
                     node.diagA += child.diagA;
                     node.upperA += child.upperA;
                     node.edge_sum += child.edge_sum;
-                    node.corner_signs_vertex_id = (node.corner_signs_vertex_id & 0xFF0000) | (child.corner_signs_vertex_id & 0xFFFF);
-                    child_signs[i] = (child.corner_signs_vertex_id & 0xFF0000) >> 16;
+                    child_signs[i] = (child.corner_signs_qef_result_z & 0xFF0000) >> 16;
                     // add active edge count
                     node.child_mask = (node.child_mask & 0xFF) | ((((node.child_mask & 0x7FFFFF00) >> 8) + ((child.child_mask & 0x7FFFFF00) >> 8)) << 8);
+                    ++child_count;
+                    child_qef_results[i] = uint2(child.qef_result_xy, child.corner_signs_qef_result_z);
                 } else {
                     child_signs[i] = (corner_signs & (1u << i)) ? 255 : 0;
                 }
@@ -1238,21 +1271,13 @@ common: [[
 
             [branch]
             if (can_collapse(corner_signs, child_signs, node_depth + 1)) {
-                // TODO: no need to solve it, just compute the residue from the sum of vertices
                 float4 qef_result = solve_qef(node);
                 [branch]
                 if (qef_result.w < tolerance) {
+                    collapsed_mask = corner_signs << 8;
+
                     node.child_mask = 0;
-
-                    uint vertex_id = node.corner_signs_vertex_id & 0xFFFF;
-                    collapsed_mask = 0;
-                    collapsed_mask |= vertex_id << 16;
-                    collapsed_mask |= corner_signs << 8;
-
-                    float4 v[2][2][2];
-                    float3 clamped_vertex = clamp(qef_result.xyz, float3(0, 0, 0), float3(REGION_SIZE, REGION_SIZE, REGION_SIZE));
-                    load_cell_densities(densities, (uint3)trunc(clamped_vertex), v);
-                    store_vertex(vertices, region_info, qef_result.xyz, vertex_id, v);
+                    ASSIGN_QEF_RESULT(node, qef_result);
 
                     store_node(octree, node_id, node);
 
@@ -1260,15 +1285,42 @@ common: [[
                     uint first_child_offset = (node_id * 8 + 1) * 4;
                     collapsed_octree.Store4(first_child_offset, 0);
                     collapsed_octree.Store4(first_child_offset + 16, 0);
+                } else {
+                    assign_child_vertices(node_id, collapsed_mask, child_qef_results, child_count, densities, collapsed_octree, vertices, region_info);
+                }
+            } else {
+                assign_child_vertices(node_id, collapsed_mask, child_qef_results, child_count, densities, collapsed_octree, vertices, region_info);
+            }
+        } else {
+            uint leaf_child_count = 0;
+            uint2 child_qef_results[8];
+            uint leaf_mask = collapsed_mask;
+            for (uint i = 0; i < 8; ++i) {
+                [branch]
+                if ((collapsed_mask & (1u << i)) != 0) {
+                    uint3 child_triple = octree.Load3((node_id * 8 + i + 1) * OCTREE_NODE_SIZE);
+                    [branch]
+                    if (child_triple.x & 0xFF) {
+                        leaf_mask &= ~(1u << i);
+                    } else {
+                        child_qef_results[i] = child_triple.zy;
+                        ++leaf_child_count;
+                    }
                 }
             }
+            [branch]
+            if (leaf_child_count)
+                assign_child_vertices(node_id, leaf_mask, child_qef_results, leaf_child_count, densities, collapsed_octree, vertices, region_info);
         }
 
         [branch]
-        if (node.child_mask) {
-            octree.InterlockedOr(OCTREE_NODE_SIZE * parent_id, 1u << 31);
-        } else {
-            store_parent_corner_sign(octree, node_id, corner_signs);
+        if (node_id) {
+            [branch]
+            if (node.child_mask) {
+                octree.InterlockedOr(OCTREE_NODE_SIZE * parent_id, 1u << 31);
+            } else {
+                store_parent_corner_sign(octree, node_id, corner_signs);
+            }
         }
 
         collapsed_octree.Store(node_id * 4, collapsed_mask);

@@ -93,7 +93,7 @@ static struct mag_async_gpu_queue_api *mag_async_gpu_queue_api;
 
 // NOTE: must be kept in sync with magnum_dc_octree.tmsl
 #define OCTREE_DEPTH 5
-#define OCTREE_NODE_SIZE 60
+#define OCTREE_NODE_SIZE 64
 
 #include "mag_octree_edges.inl"
 
@@ -262,6 +262,7 @@ typedef struct mag_terrain_settings_t
 // Region info returned from the GPU
 typedef PACK(struct gpu_region_info_t {
     uint32_t num_indices;
+    uint32_t num_vertices;
 
     // Bounds are returned relative to region_pos and are scaled by REGION_INFO_BOUNDS_SCALE. LOD scale is not applied.
     uint32_t min_x;
@@ -271,8 +272,6 @@ typedef PACK(struct gpu_region_info_t {
     uint32_t max_x;
     uint32_t max_y;
     uint32_t max_z;
-
-    TM_PAD(4);
 }) gpu_region_info_t;
 
 typedef struct mag_terrain_component_buffers_t
@@ -451,20 +450,27 @@ typedef struct read_mesh_task_buffers_t
 {
     /* carray */ uint16_t *indices;
     /* carray */ tm_vec3_t *vertices;
+    tm_renderer_handle_t unpacked_vertices;
 } read_mesh_task_buffers_t;
 
-static void init_read_mesh_task_buffers(read_mesh_task_buffers_t *buffers, tm_allocator_i *allocator)
+static void init_read_mesh_task_buffers(read_mesh_task_buffers_t *buffers, tm_shader_repository_o *shader_repo, tm_renderer_resource_command_buffer_o *res_buf, tm_allocator_i *allocator)
 {
     buffers->vertices = 0;
     buffers->indices = 0;
     tm_carray_ensure(buffers->vertices, MAX_VERTICES_PER_REGION, allocator);
     tm_carray_ensure(buffers->indices, MAX_INDICES_PER_REGION, allocator);
+
+    buffers->unpacked_vertices = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
+        &(tm_renderer_buffer_desc_t) { .size = sizeof(tm_vec3_t) * MAX_VERTICES_PER_REGION, .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_unpacked_vertices" },
+        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
 }
 
-static void destroy_read_mesh_task_buffers(read_mesh_task_buffers_t *buffers, tm_allocator_i *allocator)
+static void destroy_read_mesh_task_buffers(read_mesh_task_buffers_t *buffers, tm_renderer_resource_command_buffer_o *res_buf, tm_allocator_i *allocator)
 {
     tm_carray_free(buffers->indices, allocator);
     tm_carray_free(buffers->vertices, allocator);
+
+    tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, buffers->unpacked_vertices);
 }
 
 typedef struct mag_terrain_component_manager_o
@@ -1027,19 +1033,19 @@ static void dc_octree_collapse(tm_shader_repository_o *shader_repo, region_task_
         nodes_on_level *= 8;
     }
 
-    tm_shader_constant_buffer_instance_t cbufs[OCTREE_DEPTH];
-    tm_shader_api->create_constant_buffer_instances(io, OCTREE_DEPTH, cbufs);
+    tm_shader_constant_buffer_instance_t cbufs[OCTREE_DEPTH - 1];
+    tm_shader_api->create_constant_buffer_instances(io, OCTREE_DEPTH - 1, cbufs);
 
     tm_shader_system_context_o *shader_context = tm_shader_system_api->create_context(a, NULL);
     activate_octree_system(shader_repo, shader_context, res_buf);
     // TODO: reduce by one dispatch
     for (uint32_t depth = OCTREE_DEPTH - 1; depth > 0; --depth) {
-        set_constant(io, res_buf, cbufs + depth, TM_STATIC_HASH("tolerance", 0xc500d6c49d9c007aULL), &LODS[region_data->lod].qef_tolerance, sizeof(float));
-        set_constant(io, res_buf, cbufs + depth, TM_STATIC_HASH("first_node_id", 0x21e66c5ada72b20bULL), &last_root_id, sizeof(last_root_id));
         uint32_t parent_depth = depth - 1;
-        set_constant(io, res_buf, cbufs + depth, TM_STATIC_HASH("first_node_depth", 0x7204da62374e7fc2ULL), &parent_depth, sizeof(parent_depth));
+        set_constant(io, res_buf, cbufs + parent_depth, TM_STATIC_HASH("tolerance", 0xc500d6c49d9c007aULL), &LODS[region_data->lod].qef_tolerance, sizeof(float));
+        set_constant(io, res_buf, cbufs + parent_depth, TM_STATIC_HASH("first_node_id", 0x21e66c5ada72b20bULL), &last_root_id, sizeof(last_root_id));
+        set_constant(io, res_buf, cbufs + parent_depth, TM_STATIC_HASH("first_node_depth", 0x7204da62374e7fc2ULL), &parent_depth, sizeof(parent_depth));
         tm_renderer_shader_info_t shader_info;
-        if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, cbufs + depth, &rbinder, 1, &shader_info)) {
+        if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, cbufs + parent_depth, &rbinder, 1, &shader_info)) {
             tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { nodes_on_level, 1, 1 } }, &shader_info, 1);
             *sort_key += 1;
         }
@@ -1048,12 +1054,13 @@ static void dc_octree_collapse(tm_shader_repository_o *shader_repo, region_task_
 
         uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
         tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = buffers->collapsed_octree_handle, .source_state = state, .destination_state = state }, 1);
+        *sort_key += 1;
         tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = buffers->octree_handle, .source_state = state, .destination_state = state }, 1);
         *sort_key += 1;
     }
 
     tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
-    tm_shader_api->destroy_constant_buffer_instances(io, cbufs, OCTREE_DEPTH);
+    tm_shader_api->destroy_constant_buffer_instances(io, cbufs, OCTREE_DEPTH - 1);
 
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
@@ -1285,7 +1292,7 @@ static void destroy(tm_component_manager_o *manager)
     tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, man->precomputed_octree_edges_handle);
 
     for (uint32_t i = 0; i < MAX_TASK_BUFFERS; ++i) {
-        destroy_read_mesh_task_buffers(man->read_mesh_task_buffers + i, &man->allocator);
+        destroy_read_mesh_task_buffers(man->read_mesh_task_buffers + i, res_buf, &man->allocator);
         destroy_region_task_buffers(man->region_task_buffers + i, res_buf, &man->allocator);
     }
 
@@ -1344,7 +1351,7 @@ static void create_mag_terrain_component(tm_entity_context_o *ctx)
 
     for (uint32_t i = 0; i < MAX_TASK_BUFFERS; ++i) {
         init_region_task_buffers(manager->region_task_buffers + i, manager->shader_repo, res_buf, &manager->allocator);
-        init_read_mesh_task_buffers(manager->read_mesh_task_buffers + i, &manager->allocator);
+        init_read_mesh_task_buffers(manager->read_mesh_task_buffers + i, manager->shader_repo, res_buf, &manager->allocator);
     }
 
     manager->backend->submit_resource_command_buffers(manager->backend->inst, &res_buf, 1);
@@ -1799,9 +1806,9 @@ uint32_t readback_region_info(mag_terrain_component_buffers_t *c, tm_renderer_co
             .size = sizeof(c->region_info) });
 }
 
-uint32_t readback_unpacked_vertices(read_mesh_task_buffers_t *buffers, const mag_terrain_component_buffers_t *c, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_handle_t unpacked_vertices, uint16_t resource_state)
+uint32_t readback_unpacked_vertices(read_mesh_task_buffers_t *buffers, const mag_terrain_component_buffers_t *c, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_handle_t unpacked_vertices, uint16_t resource_state, uint32_t vertex_count)
 {
-    tm_carray_shrink(buffers->vertices, MAX_VERTICES_PER_REGION);
+    tm_carray_shrink(buffers->vertices, vertex_count);
     return tm_renderer_api->tm_renderer_command_buffer_api->read_buffer(cmd_buf, UINT64_MAX,
         &(tm_renderer_read_buffer_t) {
             .resource_handle = unpacked_vertices,
@@ -1881,15 +1888,9 @@ void generate_region_task(mag_async_gpu_queue_task_args_t *args)
     man->backend->destroy_resource_command_buffers(man->backend->inst, &post_res_buf, 1);
 }
 
-tm_renderer_handle_t unpack_vertices(tm_shader_repository_o *shader_repo, const mag_terrain_component_buffers_t *c, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, tm_renderer_resource_command_buffer_o *post_res_buf, uint64_t *sort_key)
+void unpack_vertices(tm_shader_repository_o *shader_repo, read_mesh_task_buffers_t *buffers, const mag_terrain_component_buffers_t *c, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key, uint32_t vertex_count)
 {
     TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
-
-    const uint32_t REGION_SIZE = MAG_VOXEL_REGION_SIZE * MAG_VOXEL_REGION_SIZE * MAG_VOXEL_REGION_SIZE;
-    tm_renderer_handle_t unpacked_vertices = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_buffer(res_buf,
-        &(tm_renderer_buffer_desc_t) { .size = REGION_SIZE * sizeof(tm_vec3_t), .usage_flags = TM_RENDERER_BUFFER_USAGE_STORAGE | TM_RENDERER_BUFFER_USAGE_UAV, .debug_tag = "mag_region_unpacked_vertices" },
-        TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
-    tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(post_res_buf, unpacked_vertices);
 
     tm_shader_o *shader = tm_shader_repository_api->lookup_shader(shader_repo, TM_STATIC_HASH("magnum_terrain_unpack_vertices", 0xe1fb26519ebe19d6ULL));
     tm_shader_io_o *io = tm_shader_api->shader_io(shader);
@@ -1898,24 +1899,22 @@ tm_renderer_handle_t unpack_vertices(tm_shader_repository_o *shader_repo, const 
     tm_shader_api->create_resource_binder_instances(io, 1, &rbinder);
     tm_shader_api->create_constant_buffer_instances(io, 1, &cbuf);
     set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("packed_vertices", 0xe6c723c81dbf5ba0ULL), &c->vertices_handle, 0, 0, 1);
-    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("unpacked_vertices", 0xae69f79617645fcaULL), &unpacked_vertices, 0, 0, 1);
+    set_resource(io, res_buf, &rbinder, TM_STATIC_HASH("unpacked_vertices", 0xae69f79617645fcaULL), &buffers->unpacked_vertices, 0, 0, 1);
 
     tm_shader_system_context_o *shader_context = tm_shader_system_api->create_context(a, NULL);
     tm_renderer_shader_info_t shader_info;
     if (tm_shader_api->assemble_shader_infos(shader, 0, 0, shader_context, TM_STRHASH(0), res_buf, &cbuf, &rbinder, 1, &shader_info)) {
-        tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { REGION_SIZE, 1, 1 } }, &shader_info, 1);
+        tm_renderer_api->tm_renderer_command_buffer_api->compute_dispatches(cmd_buf, sort_key, &(tm_renderer_compute_info_t) { .dispatch.group_count = { vertex_count, 1, 1 } }, &shader_info, 1);
         *sort_key += 1;
     }
 
     uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
-    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = unpacked_vertices, .source_state = state, .destination_state = state }, 1);
+    tm_renderer_api->tm_renderer_command_buffer_api->transition_resources(cmd_buf, *sort_key, &(tm_renderer_resource_barrier_t) { .resource_handle = buffers->unpacked_vertices, .source_state = state, .destination_state = state }, 1);
     *sort_key += 1;
     tm_shader_api->destroy_resource_binder_instances(io, &rbinder, 1);
     tm_shader_api->destroy_constant_buffer_instances(io, &cbuf, 1);
 
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
-
-    return unpacked_vertices;
 }
 
 void read_mesh_task(mag_async_gpu_queue_task_args_t *args)
@@ -1960,10 +1959,10 @@ void read_mesh_task(mag_async_gpu_queue_task_args_t *args)
     read_mesh_task_buffers_t *task_buffers = GET_BUFFERS(man->read_mesh_task_buffers, c->read_mesh_task_buffers_id);
 
     // TODO: cache unpacking too
-    tm_renderer_handle_t unpacked_vertices = unpack_vertices(man->shader_repo, c, cmd_buf, res_buf, post_res_buf, &sort_key);
+    unpack_vertices(man->shader_repo, task_buffers, c, cmd_buf, res_buf, &sort_key, c->region_info.num_vertices);
 
     uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
-    uint32_t vertices_fence_id = readback_unpacked_vertices(task_buffers, c, cmd_buf, unpacked_vertices, state);
+    uint32_t vertices_fence_id = readback_unpacked_vertices(task_buffers, c, cmd_buf, task_buffers->unpacked_vertices, state, c->region_info.num_vertices);
     mag_async_gpu_queue_fence_t vertices_fence = { .fence_id = vertices_fence_id, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL };
     tm_carray_push(args->out_fences, vertices_fence, args->fences_allocator);
 
@@ -2168,14 +2167,15 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
 
     typedef struct region_update_fence_t
     {
+        mag_terrain_component_t *c;
+        tm_entity_t entity;
         uint32_t fence_id;
         uint32_t region_task_buffers_id;
     } region_update_fence_t;
 
     region_update_fence_t *region_info_fences = 0;
     tm_carray_temp_ensure(region_info_fences, total_components, ta);
-    physics_update_fences_t *physics_update_fences = 0;
-    tm_carray_temp_ensure(physics_update_fences, total_components, ta);
+    uint32_t region_updates_with_physics = 0;
 
     mag_terrain_component_t **free_components = NULL;
     tm_carray_temp_ensure(free_components, total_components, ta);
@@ -2259,20 +2259,10 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
                             generate_mesh(man, GET_BUFFERS(man->region_task_buffers, region_task_buffers_id), c->buffers, &c->region_data, cmd_buf, res_buf, post_res_buf, &sort_key);
                             uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
                             uint32_t region_info_fence = readback_region_info(c->buffers, cmd_buf, state);
-                            region_update_fence_t fence = { .fence_id = region_info_fence, .region_task_buffers_id = region_task_buffers_id };
+                            region_update_fence_t fence = { .fence_id = region_info_fence, .region_task_buffers_id = region_task_buffers_id, .c = c, .entity = a->entities[i] };
                             tm_carray_temp_push(region_info_fences, fence, ta);
                             if (LODS[c->region_data.lod].needs_physics) {
-                                if (!c->buffers->read_mesh_task_buffers_id)
-                                    LOCK_BUFFERS(man->read_mesh_task_buffers_locks, c->buffers->read_mesh_task_buffers_id);
-                                read_mesh_task_buffers_t *buffers = GET_BUFFERS(man->read_mesh_task_buffers, c->buffers->read_mesh_task_buffers_id);
-                                tm_renderer_handle_t unpacked_vertices = unpack_vertices(man->shader_repo, c->buffers, cmd_buf, res_buf, post_res_buf, &sort_key);
-                                physics_update_fences_t update_fences = {
-                                    .c = c,
-                                    .entity = a->entities[i],
-                                    .indices_fence = readback_indices(buffers, c->buffers, cmd_buf, state, MAX_INDICES_PER_REGION),
-                                    .vertices_fence = readback_unpacked_vertices(buffers, c->buffers, cmd_buf, unpacked_vertices, state),
-                                };
-                                tm_carray_temp_push(physics_update_fences, update_fences, ta);
+                                ++region_updates_with_physics;
                             }
                         }
                         c->last_applied_op = tm_slab_end(man->ops);
@@ -2378,10 +2368,39 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
     // if (tm_carray_size(region_info_fences) || tm_carray_size(physics_update_fences))
     //     TM_LOG("Region updates: %llu; physics updates: %llu", tm_carray_size(region_info_fences), tm_carray_size(physics_update_fences));
 
+    physics_update_fences_t *physics_update_fences = 0;
+    tm_carray_temp_ensure(physics_update_fences, region_updates_with_physics, ta);
+    if (region_updates_with_physics) {
+        man->backend->create_command_buffers(man->backend->inst, &cmd_buf, 1);
+        man->backend->create_resource_command_buffers(man->backend->inst, &res_buf, 1);
+    }
+
     for (region_update_fence_t *region_info_fence = region_info_fences; region_info_fence != tm_carray_end(region_info_fences); ++region_info_fence) {
         while (!man->backend->read_complete(man->backend->inst, region_info_fence->fence_id, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL))
             ;
         RELEASE_BUFFERS(man->region_task_buffers_locks, region_info_fence->region_task_buffers_id);
+        mag_terrain_component_t *c = region_info_fence->c;
+        if (LODS[c->region_data.lod].needs_physics) {
+            if (!c->buffers->read_mesh_task_buffers_id)
+                LOCK_BUFFERS(man->read_mesh_task_buffers_locks, c->buffers->read_mesh_task_buffers_id);
+            read_mesh_task_buffers_t *buffers = GET_BUFFERS(man->read_mesh_task_buffers, c->buffers->read_mesh_task_buffers_id);
+            unpack_vertices(man->shader_repo, buffers, c->buffers, cmd_buf, res_buf, &sort_key, c->buffers->region_info.num_vertices);
+            uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
+            physics_update_fences_t update_fences = {
+                .c = c,
+                .entity = region_info_fence->entity,
+                .vertices_fence = readback_unpacked_vertices(buffers, c->buffers, cmd_buf, buffers->unpacked_vertices, state, c->buffers->region_info.num_vertices),
+                .indices_fence = readback_indices(buffers, c->buffers, cmd_buf, TM_RENDERER_RESOURCE_STATE_COPY_SOURCE, c->buffers->region_info.num_indices),
+            };
+            tm_carray_temp_push(physics_update_fences, update_fences, ta);
+        }
+    }
+
+    if (region_updates_with_physics) {
+        man->backend->submit_resource_command_buffers(man->backend->inst, &res_buf, 1);
+        man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
+        man->backend->submit_command_buffers(man->backend->inst, &cmd_buf, 1);
+        man->backend->destroy_command_buffers(man->backend->inst, &cmd_buf, 1);
     }
 
     for (physics_update_fences_t *update_info = physics_update_fences; update_info != tm_carray_end(physics_update_fences); ++update_info) {

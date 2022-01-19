@@ -107,12 +107,12 @@ common: [[
         float3 wp_transformed = max(0.0, (wp + (REGION_MARGIN + 1))) * 1000.0;
         uint3 minimum = floor(wp_transformed);
         uint3 maximum = ceil(wp_transformed);
-        region_info.InterlockedMin(4,  minimum.x);
-        region_info.InterlockedMin(8,  minimum.y);
-        region_info.InterlockedMin(12, minimum.z);
+        region_info.InterlockedMin(8,  minimum.x);
+        region_info.InterlockedMin(12, minimum.y);
+        region_info.InterlockedMin(16, minimum.z);
 
-        region_info.InterlockedMax(16, maximum.x);
-        region_info.InterlockedMax(20, maximum.y);
-        region_info.InterlockedMax(24, maximum.z);
+        region_info.InterlockedMax(20, maximum.x);
+        region_info.InterlockedMax(24, maximum.y);
+        region_info.InterlockedMax(28, maximum.z);
     }
 ]]
