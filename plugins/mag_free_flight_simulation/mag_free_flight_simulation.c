@@ -9,7 +9,7 @@ static struct tm_render_component_api *tm_render_component_api;
 static struct tm_transform_component_api *tm_transform_component_api;
 static struct tm_creation_graph_api *tm_creation_graph_api;
 static struct tm_temp_allocator_api *tm_temp_allocator_api;
-static struct tm_input_api* tm_input_api;
+static struct tm_input_api *tm_input_api;
 
 static struct mag_terrain_api *mag_terrain_api;
 
@@ -17,13 +17,13 @@ static struct mag_terrain_api *mag_terrain_api;
 #include <foundation/api_registry.h>
 #include <foundation/camera.h>
 #include <foundation/carray.inl>
+#include <foundation/input.h>
 #include <foundation/localizer.h>
 #include <foundation/math.inl>
 #include <foundation/rect.inl>
 #include <foundation/temp_allocator.h>
 #include <foundation/the_truth.h>
 #include <foundation/the_truth_assets.h>
-#include <foundation/input.h>
 
 #include <plugins/creation_graph/creation_graph.h>
 #include <plugins/entity/entity.h>
@@ -38,15 +38,18 @@ static struct mag_terrain_api *mag_terrain_api;
 
 #include "plugins/mag_terrain_component/mag_terrain_component.h"
 
-#define MAX_OPS_PER_SECOND 5
+#define MAX_OPS_PER_SECOND 20
 #define MAX_SCULPT_DISTANCE 64.f
 
-typedef struct input_state_t {
+typedef struct input_state_t
+{
     tm_vec2_t mouse_delta;
+    float mouse_wheel;
     bool held_keys[TM_INPUT_KEYBOARD_ITEM_COUNT];
     bool left_mouse_held;
     bool left_mouse_pressed;
-    TM_PAD(1);
+    bool right_mouse_held;
+    bool right_mouse_pressed;
 } input_state_t;
 
 typedef struct tm_simulation_state_o
@@ -66,6 +69,7 @@ typedef struct tm_simulation_state_o
     tm_entity_t sphere_aim;
     // either sphere aim or box aim
     tm_entity_t sculpt_aim;
+    float sculpt_radius;
 
     tm_entity_t player;
 
@@ -85,15 +89,16 @@ static void private__cursor_line(const tm_camera_t *camera, tm_vec2_t mouse_pos,
 static void update_aim_radius(tm_simulation_state_o *state, tm_entity_t aim, float radius)
 {
     TM_INIT_TEMP_ALLOCATOR(ta);
+    tm_transform_component_api->set_local_scale(state->transform_man, aim, (tm_vec3_t) { radius, radius, radius });
 
-    tm_creation_graph_instance_t **instances = tm_creation_graph_api->get_instances_from_component(state->tt, state->entity_ctx, aim, TM_TT_TYPE_HASH__RENDER_COMPONENT, ta);
-    tm_creation_graph_context_t ctx = (tm_creation_graph_context_t) { .rb = state->rb, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, .tt = state->tt };
+    // tm_creation_graph_instance_t **instances = tm_creation_graph_api->get_instances_from_component(state->tt, state->entity_ctx, aim, TM_TT_TYPE_HASH__RENDER_COMPONENT, ta);
+    // tm_creation_graph_context_t ctx = (tm_creation_graph_context_t) { .rb = state->rb, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL, .tt = state->tt };
 
-    for (uint32_t instance_idx = 0; instance_idx < tm_carray_size(instances); ++instance_idx) {
-        tm_creation_graph_instance_t *instance = instances[instance_idx];
-        tm_creation_graph_api->set_input_value(instance, &ctx, TM_STATIC_HASH("Radius", 0xabb1bd83748b60e4ULL), &radius, sizeof(radius));
-        tm_creation_graph_api->refresh_outputs(instance, &ctx);
-    }
+    // for (uint32_t instance_idx = 0; instance_idx < tm_carray_size(instances); ++instance_idx) {
+    //     tm_creation_graph_instance_t *instance = instances[instance_idx];
+    //     tm_creation_graph_api->set_input_value(instance, &ctx, TM_STATIC_HASH("Radius", 0xabb1bd83748b60e4ULL), &radius, sizeof(radius));
+    //     tm_creation_graph_api->refresh_outputs(instance, &ctx);
+    // }
 
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
@@ -104,13 +109,15 @@ static void update_render_visibility(tm_simulation_state_o *state, tm_entity_t e
     tm_render_component_api->set_draws_enable(render_comp, visible);
 }
 
-#define SCULPT_RADIUS 2.f
+#define DEFAULT_SCULPT_RADIUS 2.f
+#define MIN_SCULPT_RADIUS 2.f
+#define MAX_SCULPT_RADIUS 16.f
 #define SELF_SCULPT_THRESHOLD 0.5f
 
 static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
 {
     // Reset per-frame input
-    state->input.mouse_delta.x = state->input.mouse_delta.y = 0;
+    state->input.mouse_delta.x = state->input.mouse_delta.y = state->input.mouse_wheel = 0;
     state->input.left_mouse_pressed = false;
 
     // Read input
@@ -118,15 +125,21 @@ static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
     while (true) {
         uint64_t n = tm_input_api->events(state->processed_events, events, 32);
         for (uint64_t i = 0; i < n; ++i) {
-            const tm_input_event_t* e = events + i;
+            const tm_input_event_t *e = events + i;
             if (e->source && e->source->controller_type == TM_INPUT_CONTROLLER_TYPE_MOUSE) {
                 if (e->item_id == TM_INPUT_MOUSE_ITEM_BUTTON_LEFT) {
                     const bool down = e->data.f.x > 0.5f;
                     state->input.left_mouse_pressed = down && !state->input.left_mouse_held;
                     state->input.left_mouse_held = down;
+                } else if (e->item_id == TM_INPUT_MOUSE_ITEM_BUTTON_RIGHT) {
+                    const bool down = e->data.f.x > 0.5f;
+                    state->input.right_mouse_pressed = down && !state->input.right_mouse_held;
+                    state->input.right_mouse_held = down;
                 } else if (e->item_id == TM_INPUT_MOUSE_ITEM_MOVE) {
                     state->input.mouse_delta.x += e->data.f.x;
                     state->input.mouse_delta.y += e->data.f.y;
+                } else if (e->item_id == TM_INPUT_MOUSE_ITEM_WHEEL) {
+                    state->input.mouse_wheel += e->data.f.x;
                 }
             }
             if (e->source && e->source->controller_type == TM_INPUT_CONTROLLER_TYPE_KEYBOARD) {
@@ -138,6 +151,11 @@ static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
         state->processed_events += n;
         if (n < 32)
             break;
+    }
+
+    if (state->input.mouse_wheel != 0.f) {
+        state->sculpt_radius = tm_clamp(state->sculpt_radius + state->input.mouse_wheel, MIN_SCULPT_RADIUS, MAX_SCULPT_RADIUS);
+        update_aim_radius(state, state->sculpt_aim, state->sculpt_radius);
     }
 
     if (!args->ui)
@@ -157,21 +175,20 @@ static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
     private__cursor_line(camera, tm_rect_center(args->rect), args->rect, &cursor_pos, &cursor_dir);
 
     float hit_length;
-    bool ray_intersects = mag_terrain_api->cast_ray(state->terrain_mgr, cursor_pos, cursor_dir, MAX_SCULPT_DISTANCE - SCULPT_RADIUS, &hit_length);
+    bool ray_intersects = mag_terrain_api->cast_ray(state->terrain_mgr, cursor_pos, cursor_dir, MAX_SCULPT_DISTANCE - state->sculpt_radius, &hit_length);
     bool aim_visible = false;
     if (ray_intersects) {
         tm_vec3_t pos = tm_vec3_add(cursor_pos, tm_vec3_mul(cursor_dir, hit_length));
         const tm_vec3_t player_pos = tm_get_position(state->transform_man, state->player);
-        const float min_distance = (SCULPT_RADIUS + SELF_SCULPT_THRESHOLD) * (SCULPT_RADIUS + SELF_SCULPT_THRESHOLD);
+        const float min_distance = (state->sculpt_radius + SELF_SCULPT_THRESHOLD) * (state->sculpt_radius + SELF_SCULPT_THRESHOLD);
         if (tm_vec3_dist_sqr(pos, player_pos) >= min_distance) {
-            if (state->input.left_mouse_held && (args->time - state->last_op_time >= 1.0 / MAX_OPS_PER_SECOND)) {
+            if ((state->input.left_mouse_held || state->input.right_mouse_held) && (args->time - state->last_op_time >= 1.0 / MAX_OPS_PER_SECOND)) {
                 state->last_op_time = args->time;
-                mag_terrain_op_type_t op = state->input.held_keys[TM_INPUT_KEYBOARD_ITEM_LEFTSHIFT] ? TERRAIN_OP_SUBTRACT : TERRAIN_OP_UNION;
-                mag_terrain_api->apply_operation(state->terrain_mgr, op, TERRAIN_OP_SPHERE, pos, (tm_vec3_t) { SCULPT_RADIUS, SCULPT_RADIUS, SCULPT_RADIUS });
+                mag_terrain_op_type_t op = state->input.right_mouse_held ? TERRAIN_OP_SUBTRACT : TERRAIN_OP_UNION;
+                mag_terrain_api->apply_operation(state->terrain_mgr, op, TERRAIN_OP_SPHERE, pos, (tm_vec3_t) { state->sculpt_radius, state->sculpt_radius, state->sculpt_radius });
             }
             aim_visible = true;
             tm_transform_component_api->set_local_position(state->transform_man, state->sculpt_aim, pos);
-            update_aim_radius(state, state->sculpt_aim, SCULPT_RADIUS);
         }
     }
     update_render_visibility(state, state->sculpt_aim, aim_visible);
@@ -206,7 +223,10 @@ static tm_simulation_state_o *start(tm_simulation_start_args_t *args)
 
     state->player = tm_tag_component_api->find_first(tag_mgr, TM_STATIC_HASH("player", 0xafff68de8a0598dfULL));
 
+    state->sculpt_radius = DEFAULT_SCULPT_RADIUS;
+
     update_render_visibility(state, state->sculpt_aim, false);
+    update_render_visibility(state, state->sculpt_aim, state->sculpt_radius);
 
     return state;
 }
