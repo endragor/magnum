@@ -14,19 +14,14 @@ static struct tm_os_api *tm_os_api;
 
 #define THREAD_STACK_SIZE (256 * 1024)
 
-typedef struct task_t
-{
-    void (*f)(mag_async_gpu_queue_task_args_t *args);
-    void *data;
-    tm_allocator_i *data_allocator;
-    uint64_t data_size;
-    uint64_t priority;
-} task_t;
+#define task_t mag_async_gpu_queue_task_params_t
 
 typedef struct executing_task_t
 {
     uint64_t task_id;
     mag_async_gpu_queue_fence_t *fences;
+    void (*completion_callback)(void *data);
+    void *data;
 } executing_task_t;
 
 typedef struct mag_async_gpu_queue_o
@@ -202,6 +197,7 @@ static uint64_t *wait_for_task(mag_async_gpu_queue_o *q, executing_task_t *wait_
             if (!ri) {
                 tm_carray_free(task->fences, &q->allocator);
                 tm_carray_push(completed_ids, task->task_id, a);
+                task->completion_callback(task->data);
                 wait_tasks[task_i] = tm_carray_pop(wait_tasks);
             } else {
                 ++task_i;
@@ -212,12 +208,6 @@ static uint64_t *wait_for_task(mag_async_gpu_queue_o *q, executing_task_t *wait_
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 
     return completed_ids;
-}
-
-static inline void free_task_data(task_t *task)
-{
-    if (task->data_allocator)
-        tm_free(task->data_allocator, task->data, task->data_size);
 }
 
 static void process_one_task(mag_async_gpu_queue_o *q)
@@ -241,8 +231,7 @@ static void process_one_task(mag_async_gpu_queue_o *q)
         .task_id = task_id,
     };
     task.f(&args);
-    free_task_data(&task);
-    executing_task_t active_task = { .task_id = task_id, .fences = args.out_fences };
+    executing_task_t active_task = { .task_id = task_id, .fences = args.out_fences, .completion_callback = task.completion_callback, .data = task.data };
 
     TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, a);
 
@@ -359,8 +348,7 @@ static void destroy(mag_async_gpu_queue_o *q)
     thread_api->destroy_critical_section(&q->completed_tasks_cs);
 
     for (uint64_t i = 0; i < tm_carray_size(q->task_heap); ++i) {
-        task_t *task = q->task_heap + i;
-        free_task_data(task);
+        q->task_heap[i].cancel_callback(q->task_heap[i].data);
     }
 
     tm_carray_free(q->task_heap, &q->allocator);
@@ -377,16 +365,9 @@ static void destroy(mag_async_gpu_queue_o *q)
 static uint64_t submit_task(mag_async_gpu_queue_o *q, const mag_async_gpu_queue_task_params_t *params)
 {
     const uint64_t id = atomic_fetch_add_uint64_t(&q->next_id, 1);
-    const task_t t = {
-        .f = params->f,
-        .data = params->data,
-        .data_size = params->data_size,
-        .data_allocator = params->data_allocator,
-        .priority = params->priority,
-    };
 
     TM_OS_ENTER_CRITICAL_SECTION(&q->tasks_cs);
-    heap__push(&q->task_heap, &q->task_ids, t, id, &q->allocator);
+    heap__push(&q->task_heap, &q->task_ids, *params, id, &q->allocator);
     TM_OS_LEAVE_CRITICAL_SECTION(&q->tasks_cs);
 
     tm_os_api->thread->semaphore_add(q->sem, 1);
@@ -415,16 +396,21 @@ static void cancel_task(mag_async_gpu_queue_o *q, uint64_t task_id)
 {
     bool found = false;
     {
+        void (*callback)(void *data) = 0;
+        void *data = 0;
         TM_OS_ENTER_CRITICAL_SECTION(&q->tasks_cs);
         for (uint32_t i = 0; i < tm_carray_size(q->task_ids); ++i) {
             if (q->task_ids[i] == task_id) {
                 found = true;
-                free_task_data(q->task_heap + i);
+                callback = q->task_heap[i].cancel_callback;
+                data = q->task_heap[i].data;
                 heap__remove(q->task_heap, q->task_ids, i);
                 break;
             }
         }
         TM_OS_LEAVE_CRITICAL_SECTION(&q->tasks_cs);
+        if (callback)
+            callback(data);
     }
 
     if (!found) {
@@ -459,11 +445,15 @@ static bool is_task_done(mag_async_gpu_queue_o *q, uint64_t task_id)
             return true;
     }
 
+    uint64_t completed_id = 0;
+    void (*callback)(void *data) = 0;
+    void *data = 0;
     {
         TM_OS_ENTER_CRITICAL_SECTION(&q->executing_tasks_cs);
-        for (uint64_t i = 0; i < tm_carray_size(q->executing_tasks); ++i) {
+        uint64_t executing_task_count = tm_carray_size(q->executing_tasks);
+        for (uint64_t i = 0; i < executing_task_count; ++i) {
             executing_task_t *task = q->executing_tasks + i;
-            if (task->task_id == task_id) {
+            if (task->task_id == task_id || i == executing_task_count - 1) {
                 uint64_t ri = 0;
                 while (ri < tm_carray_size(task->fences)) {
                     if (q->backend->read_complete(q->backend->inst, task->fences[ri].fence_id, task->fences[ri].device_affinity_mask))
@@ -474,13 +464,29 @@ static bool is_task_done(mag_async_gpu_queue_o *q, uint64_t task_id)
                 if (!ri) {
                     // all fences are done
                     tm_carray_free(task->fences, &q->allocator);
+                    completed = task->task_id == task_id;
+                    completed_id = task->task_id;
+                    callback = task->completion_callback;
+                    data = task->data;
                     q->executing_tasks[i] = tm_carray_pop(q->executing_tasks);
-                    completed = true;
                 }
                 break;
             }
         }
         TM_OS_LEAVE_CRITICAL_SECTION(&q->executing_tasks_cs);
+    }
+
+    if (callback)
+        callback(data);
+
+    if (completed_id) {
+        // we might've freed resources for a queued task
+        tm_os_api->thread->semaphore_add(q->sem, 1);
+        if (!completed) {
+            TM_OS_ENTER_CRITICAL_SECTION(&q->completed_tasks_cs);
+            tm_carray_push(q->completed_tasks, completed_id, &q->allocator);
+            TM_OS_LEAVE_CRITICAL_SECTION(&q->completed_tasks_cs);
+        }
     }
 
     return completed;

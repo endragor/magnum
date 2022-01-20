@@ -1196,19 +1196,13 @@ static void add(tm_component_manager_o *manager, struct tm_entity_commands_o *co
     tm_os_api->thread->create_critical_section(&c->physics_data->cs);
 }
 
-static void destroy_mesh(mag_terrain_component_buffers_t *c, mag_terrain_component_manager_o *man)
+static void destroy_mesh(mag_terrain_component_buffers_t *c, tm_renderer_resource_command_buffer_o *res_buf, mag_terrain_component_manager_o *man)
 {
     if (c->vertices_handle.resource) {
-        tm_renderer_resource_command_buffer_o *res_buf;
-        man->backend->create_resource_command_buffers(man->backend->inst, &res_buf, 1);
-
         tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, c->ibuf);
         tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, c->vertices_handle);
         tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, c->densities_handle);
         tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, c->region_info_handle);
-
-        man->backend->submit_resource_command_buffers(man->backend->inst, &res_buf, 1);
-        man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
 
         c->vertices_handle = (tm_renderer_handle_t) { 0 };
         c->ibuf = (tm_renderer_handle_t) { 0 };
@@ -1222,21 +1216,9 @@ static void remove(tm_component_manager_o *manager, struct tm_entity_commands_o 
     mag_terrain_component_t *c = data;
     mag_terrain_component_manager_o *man = (mag_terrain_component_manager_o *)manager;
 
-    destroy_mesh(c->buffers, man);
-
-    tm_renderer_resource_command_buffer_o *res_buf;
-    man->backend->create_resource_command_buffers(man->backend->inst, &res_buf, 1);
-    if (c->buffers->generate_fence) {
-        tm_renderer_handle_t handle = { .resource = c->buffers->generate_fence };
-        tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, handle);
-    }
-    man->backend->submit_resource_command_buffers(man->backend->inst, &res_buf, 1);
-    man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
-
     if (c->generate_task_id) {
         while (!mag_async_gpu_queue_api->is_task_done(man->gpu_queue, c->generate_task_id))
             ;
-        RELEASE_BUFFERS(man->region_task_buffers_locks, c->buffers->gen_region_task_buffers_id);
     }
 
     if (c->read_mesh_task_id) {
@@ -1244,6 +1226,16 @@ static void remove(tm_component_manager_o *manager, struct tm_entity_commands_o 
             ;
         RELEASE_BUFFERS(man->read_mesh_task_buffers_locks, c->buffers->read_mesh_task_buffers_id);
     }
+
+    tm_renderer_resource_command_buffer_o *res_buf;
+    man->backend->create_resource_command_buffers(man->backend->inst, &res_buf, 1);
+    if (c->buffers->generate_fence) {
+        tm_renderer_handle_t handle = { .resource = c->buffers->generate_fence };
+        tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, handle);
+    }
+    destroy_mesh(c->buffers, res_buf, man);
+    man->backend->submit_resource_command_buffers(man->backend->inst, &res_buf, 1);
+    man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
 
     tm_free(&man->allocator, c->buffers, sizeof(*c->buffers));
 
@@ -1254,7 +1246,8 @@ static void remove(tm_component_manager_o *manager, struct tm_entity_commands_o 
         // because the task checks the ID not to be 0
         TM_OS_ENTER_CRITICAL_SECTION(&c->physics_data->cs);
         TM_OS_LEAVE_CRITICAL_SECTION(&c->physics_data->cs);
-        RELEASE_BUFFERS(man->read_mesh_task_buffers_locks, c->physics_data->read_mesh_task_buffers_id);
+        if (c->physics_data->read_mesh_task_buffers_id)
+            RELEASE_BUFFERS(man->read_mesh_task_buffers_locks, c->physics_data->read_mesh_task_buffers_id);
     }
 
     if (c->physics_data->buffer_id) {
@@ -1271,10 +1264,11 @@ static void remove(tm_component_manager_o *manager, struct tm_entity_commands_o 
 static void destroy(tm_component_manager_o *manager)
 {
     mag_terrain_component_manager_o *man = (mag_terrain_component_manager_o *)manager;
-    mag_async_gpu_queue_api->destroy(man->gpu_queue);
 
     const tm_component_type_t terrain_component = tm_entity_api->lookup_component_type(man->ctx, MAG_TT_TYPE_HASH__TERRAIN_COMPONENT);
     tm_entity_api->call_remove_on_all_entities(man->ctx, terrain_component);
+
+    mag_async_gpu_queue_api->destroy(man->gpu_queue);
 
     free_terrain_settings(man, tm_entity_api->the_truth(man->ctx));
     tm_slab_destroy(man->ops);
@@ -1551,12 +1545,16 @@ static void fill_bounding_volume_buffer(struct tm_component_manager_o *manager, 
     TM_PROFILER_END_FUNC_SCOPE();
 }
 
+static void free_read_mesh_task_data(void *data)
+{
+    read_mesh_task_data_t *task_data = (read_mesh_task_data_t *)data;
+    tm_free(&task_data->man->allocator, task_data, sizeof(*task_data));
+}
+
 static void handle_generate_task_completion(mag_terrain_component_manager_o *man, mag_terrain_component_t *component, tm_renderer_resource_command_buffer_o *res_buf)
 {
     component->generate_task_id = 0;
     component->last_applied_op = component->last_task_op;
-
-    RELEASE_BUFFERS(man->region_task_buffers_locks, component->buffers->gen_region_task_buffers_id);
 
     if (component->buffers->region_info.num_indices && LODS[component->region_data.lod].needs_physics) {
         read_mesh_task_data_t *task_data;
@@ -1570,9 +1568,9 @@ static void handle_generate_task_completion(mag_terrain_component_manager_o *man
         mag_async_gpu_queue_task_params_t params = {
             .f = read_mesh_task,
             .data = task_data,
-            .data_size = sizeof(*task_data),
-            .data_allocator = &man->allocator,
-            .priority = 0, // TODO: lower priority than near LODs, but higher than distant
+            .cancel_callback = free_read_mesh_task_data,
+            .completion_callback = free_read_mesh_task_data,
+            .priority = 0,
         };
         component->read_mesh_task_id = mag_async_gpu_queue_api->submit_task(man->gpu_queue, &params);
     }
@@ -2068,6 +2066,19 @@ static bool needs_sculpting(const region_data_t *region_data, tm_vec3_t camera_p
     return aabb_point_distance_sqr(&region_aabb, &camera_pos) <= MAX_SCULPT_DISTANCE * MAX_SCULPT_DISTANCE;
 }
 
+static void generate_region_cancel(void *data)
+{
+    generate_region_task_data_t *task_data = (generate_region_task_data_t *)data;
+    tm_free(&task_data->man->allocator, task_data, sizeof(*task_data));
+}
+
+static void generate_region_complete(void *data)
+{
+    generate_region_task_data_t *task_data = (generate_region_task_data_t *)data;
+    RELEASE_BUFFERS(task_data->man->region_task_buffers_locks, task_data->c->gen_region_task_buffers_id);
+    tm_free(&task_data->man->allocator, task_data, sizeof(*task_data));
+}
+
 static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *data, struct tm_entity_commands_o *commands)
 {
     TM_PROFILER_BEGIN_FUNC_SCOPE();
@@ -2257,20 +2268,19 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
                     ++active_task_count;
             } else {
                 // TM_LOG("discarding region: (%f, %f, %f) cell size %f, key %llu", c->region_data.pos.x, c->region_data.pos.y, c->region_data.pos.z, c->region_data.cell_size, c->region_data.key);
-                // TODO: use cancel, but think carefully
-                if (c->generate_task_id && mag_async_gpu_queue_api->is_task_done(man->gpu_queue, c->generate_task_id)) {
+                if (c->generate_task_id) {
+                    mag_async_gpu_queue_api->cancel_task(man->gpu_queue, c->generate_task_id);
                     c->generate_task_id = 0;
-                    RELEASE_BUFFERS(man->region_task_buffers_locks, c->buffers->gen_region_task_buffers_id);
                     c->color_rgba.w = 0.f;
                 }
+                // TODO: think of how to cancel this safely
                 if (c->read_mesh_task_id && mag_async_gpu_queue_api->is_task_done(man->gpu_queue, c->read_mesh_task_id)) {
                     RELEASE_BUFFERS(man->read_mesh_task_buffers_locks, c->buffers->read_mesh_task_buffers_id);
                     c->read_mesh_task_id = 0;
                 }
-                // TODO: don't call if this is not actually needed
-                remove_physics_components(man, c, a->entities[i], commands);
-                //if (LODS[c->region_data.lod].needs_physics) {
-                //}
+                if (c->region_data.key && LODS[c->region_data.lod].needs_physics) {
+                    remove_physics_components(man, c, a->entities[i], commands);
+                }
 
                 c->color_rgba.w -= ALPHA_SPEED * dt;
                 if ((c->color_rgba.w <= 0.f || !c->region_data.key) && !c->generate_task_id && !c->read_mesh_task_id) {
@@ -2334,8 +2344,8 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
             mag_async_gpu_queue_task_params_t params = {
                 .f = generate_region_task,
                 .data = task_data,
-                .data_size = sizeof(*task_data),
-                .data_allocator = &man->allocator,
+                .cancel_callback = generate_region_cancel,
+                .completion_callback = generate_region_complete,
                 .priority = region_priority(&c->region_data, &camera_transform->pos),
             };
             c->generate_task_id = mag_async_gpu_queue_api->submit_task(man->gpu_queue, &params);

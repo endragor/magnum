@@ -34,8 +34,8 @@ typedef struct mag_async_gpu_queue_task_params_t
 {
     void (*f)(mag_async_gpu_queue_task_args_t *args);
     void *data;
-    tm_allocator_i *data_allocator;
-    uint64_t data_size;
+    void (*cancel_callback)(void *data);
+    void (*completion_callback)(void *data);
     uint64_t priority;
 } mag_async_gpu_queue_task_params_t;
 
