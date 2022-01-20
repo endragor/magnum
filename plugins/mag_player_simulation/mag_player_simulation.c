@@ -239,7 +239,7 @@ static void tick(tm_simulation_state_o* state, tm_simulation_frame_args_t* args)
 
     struct tm_physx_mover_component_t* player_mover = tm_entity_api->get_component(state->entity_ctx, state->player, state->mover_component);
 
-    if (!TM_ASSERT(player_mover, tm_error_api->def, "Invalid player"))
+    if (!TM_ASSERT(player_mover, "Invalid player"))
         return;
 
     // For fudging jump timing
@@ -279,7 +279,7 @@ static void tick(tm_simulation_state_o* state, tm_simulation_frame_args_t* args)
         const bool can_jump = args->time < state->last_standing_time + 0.2f;
         if (can_jump && state->input.held_keys[TM_INPUT_KEYBOARD_ITEM_SPACE]) {
             tm_animation_state_machine_api->event(sm, TM_STATIC_HASH("jump", 0x7b98bf53d1dceae8ULL));
-            player_mover->velocity.y += 6;
+            player_mover->velocity.y += 12;
             state->last_standing_time = 0;
         }
     }

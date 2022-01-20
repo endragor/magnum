@@ -323,8 +323,6 @@ typedef struct mag_terrain_component_t
     uint64_t generate_task_id;
     uint64_t read_mesh_task_id;
     const op_t *last_task_op;
-
-    tm_renderer_handle_t op_fence;
 } mag_terrain_component_t;
 
 static mag_terrain_component_t default_values = {
@@ -1098,7 +1096,7 @@ static void dc_octree_contour(tm_shader_repository_o *shader_repo, region_task_b
     TM_SHUTDOWN_TEMP_ALLOCATOR(ta);
 }
 
-static void generate_mesh(mag_terrain_component_manager_o *man, region_task_buffers_t *buffers, const mag_terrain_component_buffers_t *c, const region_data_t *region_data, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, tm_renderer_resource_command_buffer_o *post_res_buf, uint64_t *sort_key)
+static void generate_mesh(mag_terrain_component_manager_o *man, region_task_buffers_t *buffers, const mag_terrain_component_buffers_t *c, const region_data_t *region_data, tm_renderer_command_buffer_o *cmd_buf, tm_renderer_resource_command_buffer_o *res_buf, uint64_t *sort_key)
 {
     dc_octree_create(man->shader_repo, buffers, c, region_data, cmd_buf, res_buf, sort_key);
     dc_octree_collapse(man->shader_repo, buffers, c, region_data, cmd_buf, res_buf, sort_key);
@@ -1154,8 +1152,6 @@ static void add(tm_component_manager_o *manager, struct tm_entity_commands_o *co
 
     tm_renderer_resource_command_buffer_o *res_buf;
     man->backend->create_resource_command_buffers(man->backend->inst, &res_buf, 1);
-
-    c->op_fence = tm_renderer_api->tm_renderer_resource_command_buffer_api->create_queue_fence(res_buf, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL);
 
     c->buffers = tm_alloc(&man->allocator, sizeof(*c->buffers));
     *c->buffers = (mag_terrain_component_buffers_t) { 0 };
@@ -1230,7 +1226,6 @@ static void remove(tm_component_manager_o *manager, struct tm_entity_commands_o 
 
     tm_renderer_resource_command_buffer_o *res_buf;
     man->backend->create_resource_command_buffers(man->backend->inst, &res_buf, 1);
-    tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, c->op_fence);
     if (c->buffers->generate_fence) {
         tm_renderer_handle_t handle = { .resource = c->buffers->generate_fence };
         tm_renderer_api->tm_renderer_resource_command_buffer_api->destroy_resource(res_buf, handle);
@@ -1467,7 +1462,7 @@ static void generate_region_gpu(tm_renderer_command_buffer_o *cmd_buf, tm_render
         if (aabb_intersect(&region_aabb, &aabb))
             apply_op_to_component(man->shader_repo, c, region_data, op, cmd_buf, res_buf, sort_key);
     }
-    generate_mesh(man, task_buffers, c, region_data, cmd_buf, res_buf, post_res_buf, sort_key);
+    generate_mesh(man, task_buffers, c, region_data, cmd_buf, res_buf, sort_key);
 }
 
 // static void dual_contour_cpu(mag_terrain_component_buffers_t *c, mag_terrain_component_manager_o *man, tm_shader_io_o *io, tm_renderer_backend_i *rb)
@@ -1684,9 +1679,6 @@ static void magnum_terrain_render(struct tm_component_manager_o *manager, struct
                 // set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("last_tm", 0x4e1b92a74efd0f26ULL), &last_tm, sizeof(last_tm));
                 // set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("tm", 0xb689d1065b3baf51ULL), &last_tm, sizeof(last_tm));
 
-                tm_mat44_t tm;
-                tm_mat44_from_translation_quaternion_scale(&tm, component->region_data.pos, (tm_vec4_t) { 0, 0, 0, 1 }, (tm_vec3_t) { 1, 1, 1 });
-                // TODO: rm
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("alpha", 0x3f6973542dd6a4fbULL), &component->color_rgba.w, sizeof(component->color_rgba.w));
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("cell_size", 0x50b5f09b4c1a94fdULL), &LODS[component->region_data.lod].size, sizeof(LODS[component->region_data.lod].size));
                 set_constant(io, args->default_resource_buffer, &cbufs[i], TM_STATIC_HASH("region_pos", 0x5af0fcabdb39700fULL), &component->region_data.pos, sizeof(component->region_data.pos));
@@ -2028,7 +2020,7 @@ static void generate_physics_task(void *task_data, uint64_t id)
                 .hash = buf_hash,
             };
         } else {
-            TM_ERROR(tm_error_api->def, "Failed to cook physics mesh. Error: %u", error);
+            TM_ERROR("Failed to cook physics mesh. Error: %u", error);
         }
     }
     TM_OS_LEAVE_CRITICAL_SECTION(&data->cs);
@@ -2045,7 +2037,7 @@ static void start_physics_task(mag_terrain_component_manager_o *man, mag_terrain
     c->physics_data->read_mesh_task_buffers_id = c->buffers->read_mesh_task_buffers_id;
     c->buffers->read_mesh_task_buffers_id = 0;
 
-    uint64_t new_task_id = tm_task_system_api->run_task(generate_physics_task, c->physics_data, "mag_terrain_generate_physics");
+    uint64_t new_task_id = tm_task_system_api->run_task(generate_physics_task, c->physics_data, "mag_terrain_generate_physics", 0, true);
     cur_task_id = atomic_exchange_uint64_t(&c->physics_data->current_task_id, new_task_id);
     TM_OS_LEAVE_CRITICAL_SECTION(&c->physics_data->cs);
 
@@ -2232,14 +2224,6 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
                     c->color_rgba.w = min(1.0f, c->color_rgba.w + ALPHA_SPEED * dt);
                     // TODO: do we need to wait for physics too?
                     if (c->last_applied_op != tm_slab_end(man->ops) && !c->read_mesh_task_id) {
-                        const tm_renderer_queue_bind_t bind_info = {
-                            .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL,
-                            .queue_family = TM_RENDERER_QUEUE_GRAPHICS,
-                            .scheduling.signal_device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL,
-                            .scheduling.signal_queue_fence = c->op_fence,
-                        };
-
-                        tm_renderer_api->tm_renderer_command_buffer_api->bind_queue(cmd_buf, sort_key, &bind_info);
                         ++sort_key;
                         const aabb_t region_aabb = region_aabb_with_margin(&c->region_data);
                         bool applied_something = false;
@@ -2256,7 +2240,7 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
                         if (applied_something) {
                             uint32_t region_task_buffers_id;
                             LOCK_BUFFERS(man->region_task_buffers_locks, region_task_buffers_id);
-                            generate_mesh(man, GET_BUFFERS(man->region_task_buffers, region_task_buffers_id), c->buffers, &c->region_data, cmd_buf, res_buf, post_res_buf, &sort_key);
+                            generate_mesh(man, GET_BUFFERS(man->region_task_buffers, region_task_buffers_id), c->buffers, &c->region_data, cmd_buf, res_buf, &sort_key);
                             uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
                             uint32_t region_info_fence = readback_region_info(c->buffers, cmd_buf, state);
                             region_update_fence_t fence = { .fence_id = region_info_fence, .region_task_buffers_id = region_task_buffers_id, .c = c, .entity = a->entities[i] };
@@ -2375,12 +2359,13 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
         man->backend->create_resource_command_buffers(man->backend->inst, &res_buf, 1);
     }
 
+    uint64_t region_updates_profiler_id = tm_profiler_api->begin("wait_for_region_updates", NULL, NULL);
     for (region_update_fence_t *region_info_fence = region_info_fences; region_info_fence != tm_carray_end(region_info_fences); ++region_info_fence) {
         while (!man->backend->read_complete(man->backend->inst, region_info_fence->fence_id, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL))
             ;
         RELEASE_BUFFERS(man->region_task_buffers_locks, region_info_fence->region_task_buffers_id);
         mag_terrain_component_t *c = region_info_fence->c;
-        if (LODS[c->region_data.lod].needs_physics) {
+        if (LODS[c->region_data.lod].needs_physics && c->buffers->region_info.num_indices) {
             if (!c->buffers->read_mesh_task_buffers_id)
                 LOCK_BUFFERS(man->read_mesh_task_buffers_locks, c->buffers->read_mesh_task_buffers_id);
             read_mesh_task_buffers_t *buffers = GET_BUFFERS(man->read_mesh_task_buffers, c->buffers->read_mesh_task_buffers_id);
@@ -2395,7 +2380,9 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
             tm_carray_temp_push(physics_update_fences, update_fences, ta);
         }
     }
+    tm_profiler_api->end(region_updates_profiler_id);
 
+    uint64_t physics_updates_profiler_id = tm_profiler_api->begin("physics_updates", NULL, NULL);
     if (region_updates_with_physics) {
         man->backend->submit_resource_command_buffers(man->backend->inst, &res_buf, 1);
         man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
@@ -2430,6 +2417,7 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
             update_physics_component(man, update_info->c, update_info->entity, commands);
         }
     }
+    tm_profiler_api->end(physics_updates_profiler_id);
 
     if (!terrain_regions_stat) {
         terrain_regions_stat = tm_statistics_source_api->source("magnum/terrain_regions", "Terrain Regions");
