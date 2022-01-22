@@ -27,8 +27,8 @@ compute_shader: {
                 for (uint dy = 0; dy != 2; ++dy) {
                     float v0 = v[dx][dy][0].w;
                     float v1 = v[dx][dy][1].w;
-                    float solid0 = step(v0, 0);
-                    float solid1 = step(v1, 0);
+                    float solid0 = step(0, v0);
+                    float solid1 = step(0, v1);
                     [branch]
                     if (solid0 != solid1) {
                         float distance = v0 / (v0 - v1);
@@ -48,8 +48,8 @@ compute_shader: {
                 for (uint dz = 0; dz != 2; ++dz) {
                     float v0 = v[dx][0][dz].w;
                     float v1 = v[dx][1][dz].w;
-                    float solid0 = step(v0, 0);
-                    float solid1 = step(v1, 0);
+                    float solid0 = step(0, v0);
+                    float solid1 = step(0, v1);
                     [branch]
                     if (solid0 != solid1) {
                         float distance = v0 / (v0 - v1);
@@ -68,8 +68,8 @@ compute_shader: {
                 for (uint dz = 0; dz != 2; ++dz) {
                     float v0 = v[0][dy][dz].w;
                     float v1 = v[1][dy][dz].w;
-                    float solid0 = step(v0, 0);
-                    float solid1 = step(v1, 0);
+                    float solid0 = step(0, v0);
+                    float solid1 = step(0, v1);
                     [branch]
                     if (solid0 != solid1) {
                         float distance = v0 / (v0 - v1);
