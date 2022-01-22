@@ -13,17 +13,6 @@ depth_stencil_states: {
 	stencil_front_reference: 0
 }
 
-samplers: {
-	default_sampler: {
-		min_filter: "linear"
-		max_filter: "linear"
-		mip_mode: "linear"
-		address_u: "wrap"
-		address_v: "wrap"
-		address_w: "wrap"
-	}
-}
-
 raster_states: {
     polygon_mode: "fill"
     cull_mode: "back"
@@ -31,23 +20,7 @@ raster_states: {
 }
 
 imports: [
-    { name: "cell_size" type: "float" }
-    { name: "region_pos" type: "float3" }
-    { name: "alpha" type: "float" }
     { name: "camera_pos" type: "float3" }
-    { name: "depth_bias" type: "float" }
-
-    { name: "cull_min" type: "float3" }
-    { name: "cull_max" type: "float3" }
-    { name: "entity_id" type: "uint2" }
-
-    // half-float vertices followed by normals
-    { name: "vertices" type: "buffer" }
-
-    { name: "default_sampler" type: "sampler" sampler: "default_sampler" }
-    { name: "diffuse_map" type: "texture_2d" element_type: "float4" elements: 2 }
-    { name: "normal_map" type: "texture_2d" element_type: "float4" elements: 2}
-    { name: "orm_map" type: "texture_2d" element_type: "float4" elements: 2}
 ]
 
 common: [[
@@ -284,6 +257,7 @@ pixel_shader: {
             float ao = orm.x;
             //roughness = 1.f;
             //ao = 1.f;
+            //metallic = 0.f;
 
             float4 base = 0;
 
@@ -324,7 +298,7 @@ compile : {
 
     configurations: {
         shadows: [
-            { systems: ["frame_system", "viewer_system", "shadow_system"]
+            { systems: ["frame_system", "viewer_system", "shadow_system", "magnum_terrain_region_render_system" ]
                 variations: [
                     { systems: [] }
                 ]
@@ -332,7 +306,7 @@ compile : {
         ]
 
         gbuffer: [
-            { systems: ["frame_system", "viewer_system", "gbuffer_system"]
+            { systems: ["frame_system", "viewer_system", "gbuffer_system", "magnum_terrain_material_system", "magnum_terrain_region_render_system" ]
                 variations: {
                     compile_variations: [ ["picking_system"], [] ]
                     variations: [
@@ -343,7 +317,7 @@ compile : {
         ]
 
         gbuffer_advanced: [
-            { systems: ["frame_system", "viewer_system", "gbuffer_system", "gbuffer_aux_system"]
+            { systems: ["frame_system", "viewer_system", "gbuffer_system", "gbuffer_aux_system", "magnum_terrain_material_system", "magnum_terrain_region_render_system" ]
                 variations: [
                     { systems: [] }
                 ]

@@ -1,0 +1,20 @@
+samplers: {
+	default_sampler: {
+		min_filter: "linear"
+		max_filter: "linear"
+		mip_mode: "linear"
+		address_u: "wrap"
+		address_v: "wrap"
+		address_w: "wrap"
+	}
+}
+
+imports: [
+    { name: "diffuse_map" type: "texture_2d" element_type: "float4" elements: 2 }
+    { name: "normal_map" type: "texture_2d" element_type: "float4" elements: 2 }
+    { name: "orm_map" type: "texture_2d" element_type: "float4" elements: 2 }
+    { name: "default_sampler" type: "sampler" sampler: "default_sampler" }
+]
+
+system : {
+}

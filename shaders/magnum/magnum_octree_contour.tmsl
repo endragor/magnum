@@ -1,14 +1,6 @@
-imports: [
-    { name: "collapsed_octree" type: "buffer" }
-    { name: "precomputed_edges" type: "buffer" }
-
-    { name: "index_counter" type: "buffer" uav: true }
-    { name: "triangles" type: "buffer" uav: true }
-]
-
 compile: {
     variations : [
-        { systems: ["magnum_dc_octree"] }
+        { systems: ["magnum_dc_octree", "magnum_terrain_octree_system", "magnum_terrain_region_contouring_system"] }
     ]
 }
 
@@ -23,7 +15,7 @@ compute_shader: {
         uint edge_idx = dispatch_thread_id.x * 2 + dispatch_thread_id.y;
         uint4 edge = get_precomputed_edges().Load4(edge_idx * 16);
 
-        try_add_edge_polygon(get_collapsed_octree(), edge, get_triangles(), get_index_counter());
-        //dual_contour_octree(get_collapsed_octree(), 0, get_triangles(), get_index_counter());
+        try_add_edge_polygon(get_collapsed_octree(), edge, get_triangles(), get_region_info());
+        //dual_contour_octree(get_collapsed_octree(), 0, get_triangles(), get_region_info());
     ]]
 }

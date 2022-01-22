@@ -1,0 +1,7 @@
+imports: [
+    { name: "octree" type: "buffer" uav: true }
+    { name: "collapsed_octree" type: "buffer" uav: true }
+]
+
+system : {
+}

@@ -1,7 +1,6 @@
 imports: [
-    { name: "region_pos" type: "float3" }
     { name: "cell_size" type: "float" }
-
+    { name: "region_pos" type: "float3" }
     { name: "densities" type: "buffer" uav: true }
 ]
 

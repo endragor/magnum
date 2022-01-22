@@ -1,0 +1,16 @@
+imports: [
+    { name: "cell_size" type: "float" }
+    { name: "region_pos" type: "float3" }
+    { name: "alpha" type: "float" }
+    { name: "depth_bias" type: "float" }
+
+    { name: "cull_min" type: "float3" }
+    { name: "cull_max" type: "float3" }
+    { name: "entity_id" type: "uint2" }
+
+    // half-float vertices followed by normals
+    { name: "vertices" type: "buffer" }
+]
+
+system : {
+}
