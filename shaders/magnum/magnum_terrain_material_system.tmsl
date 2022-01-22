@@ -1,0 +1,8 @@
+imports: [
+    { name: "diffuse_map" type: "texture_2d" element_type: "float4" elements: 2 }
+    { name: "normal_map" type: "texture_2d" element_type: "float4" elements: 2 }
+    { name: "orm_map" type: "texture_2d" element_type: "float4" elements: 2 }
+]
+
+system : {
+}

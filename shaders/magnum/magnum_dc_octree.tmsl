@@ -2,6 +2,7 @@
 
 imports: [
     { name: "is_critical_cube" type: "uint" elements: 256 }
+    { name: "precomputed_edges" type: "buffer" }
 ]
 
 common: [[
@@ -128,7 +129,7 @@ common: [[
     #define OCTREE_AXIS_Y 1
     #define OCTREE_AXIS_X 2
 
-    void try_add_edge_polygon(ByteAddressBuffer collapsed_octree, uint4 edge, RWByteAddressBuffer triangles, RWByteAddressBuffer index_counter) {
+    void try_add_edge_polygon(RWByteAddressBuffer collapsed_octree, uint4 edge, RWByteAddressBuffer triangles, RWByteAddressBuffer index_counter) {
         uint axis = edge.x >> 30u;
         edge.x &= ~(3u << 30u);
 

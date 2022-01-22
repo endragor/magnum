@@ -1,0 +1,10 @@
+imports: [
+    { name: "tolerance" type: "float" }
+    { name: "densities" type: "buffer" }
+    { name: "region_info" type: "buffer" uav: true }
+    { name: "triangles" type: "buffer" uav: true }
+    { name: "vertices" type: "buffer" uav: true }
+]
+
+system : {
+}

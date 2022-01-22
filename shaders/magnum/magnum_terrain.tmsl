@@ -21,6 +21,14 @@ samplers: {
 		address_u: "wrap"
 		address_v: "wrap"
 		address_w: "wrap"
+		mip_lod_bias: 0
+		anisotropy_enable: true
+		max_anisotropy: 16
+		compare_enable: false
+		compare_op: "less_equal"
+		min_lod: 0
+		max_lod: 16
+		border_color: "float_opaque_white"
 	}
 }
 
@@ -31,27 +39,12 @@ raster_states: {
 }
 
 imports: [
-    { name: "cell_size" type: "float" }
-    { name: "region_pos" type: "float3" }
-    { name: "alpha" type: "float" }
-    { name: "camera_pos" type: "float3" }
-    { name: "depth_bias" type: "float" }
-
-    { name: "cull_min" type: "float3" }
-    { name: "cull_max" type: "float3" }
-    { name: "entity_id" type: "uint2" }
-
-    // half-float vertices followed by normals
-    { name: "vertices" type: "buffer" }
-
     { name: "default_sampler" type: "sampler" sampler: "default_sampler" }
-    { name: "diffuse_map" type: "texture_2d" element_type: "float4" elements: 2 }
-    { name: "normal_map" type: "texture_2d" element_type: "float4" elements: 2}
-    { name: "orm_map" type: "texture_2d" element_type: "float4" elements: 2}
+    { name: "camera_pos" type: "float3" }
 ]
 
 common: [[
-    #define TEXTURE_SCALE 0.02
+    #define TEXTURE_SCALE 0.2
 
     float3 blends(float3 wn) {
         float3 blend = pow(abs(wn), 4);
@@ -273,7 +266,7 @@ pixel_shader: {
             SamplerState sampler = get_default_sampler();
             float3 normal = triplanar_normal_whiteout(get_normal_map(0), get_normal_map(1), sampler, input.wp, wn, blend);
             //blend = blends(normal);
-            //normal = wn;
+            normal = wn;
             float3 color = triplanar_blend(get_diffuse_map(0), get_diffuse_map(1), sampler, input.wp, blend);
             float3 orm = triplanar_blend(get_orm_map(0), get_orm_map(1), sampler, input.wp, blend);
             //normal = magnum_density(input.wp).xyz;
@@ -284,6 +277,7 @@ pixel_shader: {
             float ao = orm.x;
             //roughness = 1.f;
             //ao = 1.f;
+            //metallic = 0.f;
 
             float4 base = 0;
 
@@ -324,7 +318,7 @@ compile : {
 
     configurations: {
         shadows: [
-            { systems: ["frame_system", "viewer_system", "shadow_system"]
+            { systems: ["frame_system", "viewer_system", "shadow_system", "magnum_terrain_region_render_system" ]
                 variations: [
                     { systems: [] }
                 ]
@@ -332,7 +326,7 @@ compile : {
         ]
 
         gbuffer: [
-            { systems: ["frame_system", "viewer_system", "gbuffer_system"]
+            { systems: ["frame_system", "viewer_system", "gbuffer_system", "magnum_terrain_material_system", "magnum_terrain_region_render_system" ]
                 variations: {
                     compile_variations: [ ["picking_system"], [] ]
                     variations: [
@@ -343,7 +337,7 @@ compile : {
         ]
 
         gbuffer_advanced: [
-            { systems: ["frame_system", "viewer_system", "gbuffer_system", "gbuffer_aux_system"]
+            { systems: ["frame_system", "viewer_system", "gbuffer_system", "gbuffer_aux_system", "magnum_terrain_material_system", "magnum_terrain_region_render_system" ]
                 variations: [
                     { systems: [] }
                 ]
@@ -357,7 +351,7 @@ compile : {
         ]
 
         viewport: [
-            { layer: "gbuffer_advanced" condition: { systems_active: ["gbuffer_aux_system"] } configuration: "gbuffer_advanced" }
+            //{ layer: "gbuffer_advanced" condition: { systems_active: ["gbuffer_aux_system"] } configuration: "gbuffer_advanced" }
             { layer: "gbuffer" condition: { systems_active: ["gbuffer_system"] } configuration: "gbuffer" }
         ]
     }

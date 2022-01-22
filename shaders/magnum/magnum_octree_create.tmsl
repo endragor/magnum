@@ -1,16 +1,8 @@
-imports: [
-    { name: "densities" type: "buffer" }
-    { name: "octree" type: "buffer" uav: true }
-    { name: "collapsed_octree" type: "buffer" uav: true }
-    { name: "vertices" type: "buffer" uav: true }
-    { name: "region_info" type: "buffer" uav: true }
-]
-
 compile: {
     includes: [ "magnum_common" ]
 
     variations : [
-        { systems: ["magnum_dc_octree"] }
+        { systems: ["magnum_dc_octree", "magnum_terrain_octree_system", "magnum_terrain_region_contouring_system"] }
     ]
 }
 

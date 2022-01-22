@@ -48,7 +48,7 @@ struct mag_terrain_api
     // ray_dir is expected to be normalized.
     bool (*cast_ray)(mag_terrain_component_manager_o *man, tm_vec3_t ray_origin, tm_vec3_t ray_dir, float max_distance, float *hit_distance);
 
-    void (*apply_operation)(mag_terrain_component_manager_o *man, mag_terrain_op_type_t type, mag_terrain_op_primitive_t primitive, tm_vec3_t pos, tm_vec3_t size);
+    void (*apply_operation)(mag_terrain_component_manager_o *man, mag_terrain_op_type_t type, mag_terrain_op_primitive_t primitive, tm_vec3_t pos, tm_vec3_t radius);
 };
 
 #define mag_terrain_api_version TM_VERSION(1, 0, 0)
