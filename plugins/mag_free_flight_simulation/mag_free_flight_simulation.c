@@ -167,8 +167,10 @@ static void tick(tm_simulation_state_o *state, tm_simulation_frame_args_t *args)
         return;
 
     const tm_camera_t *camera = tm_entity_api->get_blackboard_ptr(state->entity_ctx, TM_ENTITY_BB__CAMERA);
-    if (!camera)
+    if (!camera || tm_simulation_api->default_camera(state->simulation_ctx).u64 == tm_simulation_api->camera(state->simulation_ctx).u64) {
+        update_render_visibility(state, state->sculpt_aim, false);
         return;
+    }
 
     tm_vec3_t cursor_pos;
     tm_vec3_t cursor_dir;
