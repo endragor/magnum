@@ -1854,15 +1854,8 @@ void read_mesh_task(mag_async_gpu_queue_task_args_t *args)
 static double *terrain_regions_stat;
 static double *terrain_vertices_stat;
 
-static void generate_physics_task(void *task_data, uint64_t id)
+static void do_generate_physics(generate_physics_task_data_t *data, tm_buffers_i *buffers, read_mesh_task_buffers_t *read_mesh_buffers)
 {
-    generate_physics_task_data_t *data = (generate_physics_task_data_t *)task_data;
-    tm_buffers_i *buffers = tm_the_truth_api->buffers(data->tt);
-
-    read_mesh_task_buffers_t *read_mesh_buffers = GET_BUFFERS(data->man->read_mesh_task_buffers, data->read_mesh_task_buffers_id);
-
-    TM_OS_ENTER_CRITICAL_SECTION(&data->cs);
-    if (atomic_fetch_add_uint64_t(&data->current_task_id, 0) == id) {
         tm_physics_cook_mesh_raw_args_t args = {
             .vertex_data = read_mesh_buffers->vertices,
             .vertex_count = (uint32_t)tm_carray_size(read_mesh_buffers->vertices),
@@ -1902,12 +1895,34 @@ static void generate_physics_task(void *task_data, uint64_t id)
             TM_ERROR("Failed to cook physics mesh. Error: %u", error);
         }
     }
+
+static void generate_physics_job(void *task_data)
+{
+    generate_physics_task_data_t *data = (generate_physics_task_data_t *)task_data;
+    tm_buffers_i *buffers = tm_the_truth_api->buffers(data->tt);
+
+    read_mesh_task_buffers_t *read_mesh_buffers = GET_BUFFERS(data->man->read_mesh_task_buffers, data->read_mesh_task_buffers_id);
+    do_generate_physics(data, buffers, read_mesh_buffers);
+    RELEASE_BUFFERS(data->man->read_mesh_task_buffers_locks, data->read_mesh_task_buffers_id);
+}
+
+static void generate_physics_task(void *task_data, uint64_t id)
+{
+    generate_physics_task_data_t *data = (generate_physics_task_data_t *)task_data;
+    tm_buffers_i *buffers = tm_the_truth_api->buffers(data->tt);
+
+    read_mesh_task_buffers_t *read_mesh_buffers = GET_BUFFERS(data->man->read_mesh_task_buffers, data->read_mesh_task_buffers_id);
+
+    TM_OS_ENTER_CRITICAL_SECTION(&data->cs);
+    if (atomic_fetch_add_uint64_t(&data->current_task_id, 0) == id) {
+        do_generate_physics(data, buffers, read_mesh_buffers);
+    }
     TM_OS_LEAVE_CRITICAL_SECTION(&data->cs);
 
     RELEASE_BUFFERS(data->man->read_mesh_task_buffers_locks, data->read_mesh_task_buffers_id);
 }
 
-static void start_physics_task(mag_terrain_component_manager_o *man, mag_terrain_component_t *c)
+static void start_physics_task(mag_terrain_component_manager_o *man, mag_terrain_component_t *c, tm_jobdecl_t *job)
 {
     uint64_t cur_task_id;
     TM_OS_ENTER_CRITICAL_SECTION(&c->physics_data->cs);
@@ -1916,12 +1931,17 @@ static void start_physics_task(mag_terrain_component_manager_o *man, mag_terrain
     c->physics_data->read_mesh_task_buffers_id = c->buffers->read_mesh_task_buffers_id;
     c->buffers->read_mesh_task_buffers_id = 0;
 
-    uint64_t new_task_id = tm_task_system_api->run_task(generate_physics_task, c->physics_data, "mag_terrain_generate_physics", 0, true);
+    uint64_t new_task_id = 0;
+    if (!job)
+        new_task_id = tm_task_system_api->run_task(generate_physics_task, c->physics_data, "mag_terrain_generate_physics", 0, true);
     cur_task_id = atomic_exchange_uint64_t(&c->physics_data->current_task_id, new_task_id);
     TM_OS_LEAVE_CRITICAL_SECTION(&c->physics_data->cs);
 
     if (cur_task_id)
         tm_task_system_api->cancel_task(cur_task_id);
+
+    if (job)
+        *job = (tm_jobdecl_t) { .task = generate_physics_job, .data = c->physics_data };
 }
 
 static void remove_physics_components(mag_terrain_component_manager_o *man, mag_terrain_component_t *c, tm_entity_t entity, struct tm_entity_commands_o *commands)
@@ -2047,6 +2067,9 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
         tm_entity_t entity;
         uint32_t vertices_fence;
         uint32_t indices_fence;
+        bool vertices_read;
+        bool indices_read;
+        bool task_started;
     } physics_update_fences_t;
 
     typedef struct region_update_fence_t
@@ -2108,7 +2131,7 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
 
                 if (c->read_mesh_task_id && mag_async_gpu_queue_api->is_task_done(man->gpu_queue, c->read_mesh_task_id)) {
                     c->read_mesh_task_id = 0;
-                    start_physics_task(man, c);
+                    start_physics_task(man, c, NULL);
                 }
 
                 if (c->physics_data->current_task_id && tm_task_system_api->is_task_done(c->physics_data->current_task_id)) {
@@ -2294,31 +2317,39 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
     }
     tm_profiler_api->end(region_updates_profiler_id);
 
-    uint64_t physics_updates_profiler_id = tm_profiler_api->begin("physics_updates", NULL, NULL);
     if (region_updates_with_physics) {
+        uint64_t submit_readback_physics_profiler_id = tm_profiler_api->begin("submit_readback_physics", NULL, NULL);
         man->backend->submit_resource_command_buffers(man->backend->inst, &res_buf, 1);
         man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
         man->backend->submit_command_buffers(man->backend->inst, &cmd_buf, 1);
         man->backend->destroy_command_buffers(man->backend->inst, &cmd_buf, 1);
+        tm_profiler_api->end(submit_readback_physics_profiler_id);
     }
 
+    uint64_t wait_physics_readbacks_profiler_id = tm_profiler_api->begin("wait_physics_readbacks", NULL, NULL);
+    uint64_t remaining_updates = tm_carray_size(physics_update_fences);
+    while (remaining_updates) {
     for (physics_update_fences_t *update_info = physics_update_fences; update_info != tm_carray_end(physics_update_fences); ++update_info) {
-        while (!man->backend->read_complete(man->backend->inst, update_info->vertices_fence, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL))
-            ;
-        while (!man->backend->read_complete(man->backend->inst, update_info->indices_fence, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL))
-            ;
-
+            if (!update_info->vertices_read && man->backend->read_complete(man->backend->inst, update_info->vertices_fence, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL)) {
+                update_info->vertices_read = true;
+            }
+            if (!update_info->indices_read && man->backend->read_complete(man->backend->inst, update_info->indices_fence, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL)) {
+                update_info->indices_read = true;
+            }
+            if (!update_info->task_started && update_info->vertices_read && update_info->indices_read) {
+                --remaining_updates;
+                update_info->task_started = true;
         mag_terrain_component_t *c = update_info->c;
-        if (c->buffers->region_info.num_indices) {
             read_mesh_task_buffers_t *buffers = GET_BUFFERS(man->read_mesh_task_buffers, c->buffers->read_mesh_task_buffers_id);
             tm_carray_resize(buffers->indices, c->buffers->region_info.num_indices, &man->allocator);
             // TODO: job would be better in this case
-            start_physics_task(man, c);
-        } else {
-            RELEASE_BUFFERS(man->read_mesh_task_buffers_locks, c->buffers->read_mesh_task_buffers_id);
+                start_physics_task(man, c, NULL);
         }
     }
+    }
+    tm_profiler_api->end(wait_physics_readbacks_profiler_id);
 
+    uint64_t create_physics_meshes_profiler_id = tm_profiler_api->begin("create_physics_meshes", NULL, NULL);
     for (physics_update_fences_t *update_info = physics_update_fences; update_info != tm_carray_end(physics_update_fences); ++update_info) {
         mag_terrain_component_t *c = update_info->c;
         remove_physics_components(man, c, update_info->entity, commands);
@@ -2329,7 +2360,7 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
             update_physics_component(man, update_info->c, update_info->entity, commands);
         }
     }
-    tm_profiler_api->end(physics_updates_profiler_id);
+    tm_profiler_api->end(create_physics_meshes_profiler_id);
 
     if (!terrain_regions_stat) {
         terrain_regions_stat = tm_statistics_source_api->source("magnum/terrain_regions", "Terrain Regions");
