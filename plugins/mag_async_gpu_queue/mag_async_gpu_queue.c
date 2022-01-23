@@ -19,7 +19,7 @@ static struct tm_os_api *tm_os_api;
 typedef struct executing_task_t
 {
     uint64_t task_id;
-    mag_async_gpu_queue_fence_t *fences;
+    uint32_t *fences;
     void (*completion_callback)(void *data);
     void *data;
 } executing_task_t;
@@ -29,6 +29,7 @@ typedef struct mag_async_gpu_queue_o
     tm_allocator_i allocator;
     tm_renderer_backend_i *backend;
     uint32_t max_simultaneous_tasks;
+    uint32_t device_affinity_mask;
 
     tm_thread_o thread;
     atomic_uint_least32_t shutdown;
@@ -139,17 +140,10 @@ static void heap__remove(task_t *heap, uint64_t *task_ids, uint32_t i)
     }
 }
 
-static void wait_for_fences(tm_renderer_backend_i *backend, mag_async_gpu_queue_fence_t *fences, bool *signaled, uint32_t n)
+static void wait_for_fences(tm_renderer_backend_i *backend, uint32_t *fences, bool *signaled, uint32_t n, uint32_t device_affinity_mask)
 {
-    bool something_signaled = false;
-    while (!something_signaled) {
-        for (uint64_t i = 0; i < tm_carray_size(fences); ++i) {
-            if (backend->read_complete(backend->inst, fences[i].fence_id, fences[i].device_affinity_mask)) {
-                signaled[i] = true;
-                something_signaled = true;
-            }
-        }
-    }
+    while (!backend->wait_for_reads(backend->inst, fences, signaled, n, UINT64_MAX, device_affinity_mask))
+        ;
 }
 
 // Waits until at least one of the tasks is fully completed.
@@ -158,29 +152,35 @@ static uint64_t *wait_for_task(mag_async_gpu_queue_o *q, executing_task_t *wait_
     TM_INIT_TEMP_ALLOCATOR_WITH_ADAPTER(ta, taa);
 
     uint64_t *completed_ids = NULL;
+    uint32_t *fences = NULL;
+    struct fence_index
+    {
+        uint32_t task_i;
+        uint32_t fence_i;
+    } *fence_indexes = NULL;
+    bool *signaled = NULL;
+
     while (!tm_carray_size(completed_ids)) {
-        mag_async_gpu_queue_fence_t *fences = NULL;
-        struct fence_index
-        {
-            uint32_t task_i;
-            uint32_t fence_i;
-        } *fence_indexes = NULL;
+        tm_carray_shrink(fences, 0);
+        tm_carray_shrink(fence_indexes, 0);
         for (uint32_t i = 0; i < tm_carray_size(wait_tasks); ++i) {
             tm_carray_push_array(fences, wait_tasks[i].fences, tm_carray_size(wait_tasks[i].fences), taa);
             for (uint32_t fi = 0; fi < tm_carray_size(wait_tasks[i].fences); ++fi) {
                 struct fence_index index = { i, fi };
-                tm_carray_push(fence_indexes, index, taa);
+                tm_carray_temp_push(fence_indexes, index, ta);
             }
         }
-        bool *signaled = tm_carray_create(bool, tm_carray_size(fences), taa);
-        wait_for_fences(q->backend, fences, signaled, (uint32_t)tm_carray_size(fences));
+
+        tm_carray_temp_resize(signaled, tm_carray_size(fences), ta);
+        memset(signaled, 0, sizeof(*signaled) * tm_carray_size(signaled));
+        wait_for_fences(q->backend, fences, signaled, (uint32_t)tm_carray_size(fences), q->device_affinity_mask);
 
         for (uint64_t i = 0; i < tm_carray_size(fences); ++i) {
             if (signaled[i]) {
                 executing_task_t *task = wait_tasks + fence_indexes[i].task_i;
                 // Cannot swap-remove yet, as it will invalidate the indexes.
                 // Just mark the fence so that we can remove it later.
-                task->fences[fence_indexes[i].fence_i].fence_id = 0;
+                task->fences[fence_indexes[i].fence_i] = 0;
             }
         }
 
@@ -189,7 +189,7 @@ static uint64_t *wait_for_task(mag_async_gpu_queue_o *q, executing_task_t *wait_
             executing_task_t *task = wait_tasks + task_i;
             uint64_t ri = 0;
             while (ri < tm_carray_size(task->fences)) {
-                if (!task->fences[ri].fence_id)
+                if (!task->fences[ri])
                     task->fences[ri] = tm_carray_pop(task->fences);
                 else
                     ++ri;
@@ -325,6 +325,7 @@ static mag_async_gpu_queue_o *create(tm_allocator_i *parent, tm_renderer_backend
         .next_id = 1,
         .sem = thread_api->create_semaphore(0),
         .max_simultaneous_tasks = params->max_simultaneous_tasks,
+        .device_affinity_mask = params->device_affinity_mask,
     };
     thread_api->create_critical_section(&q->tasks_cs);
     thread_api->create_critical_section(&q->completed_tasks_cs);
@@ -456,7 +457,7 @@ static bool is_task_done(mag_async_gpu_queue_o *q, uint64_t task_id)
             if (task->task_id == task_id || i == executing_task_count - 1) {
                 uint64_t ri = 0;
                 while (ri < tm_carray_size(task->fences)) {
-                    if (q->backend->read_complete(q->backend->inst, task->fences[ri].fence_id, task->fences[ri].device_affinity_mask))
+                    if (q->backend->read_complete(q->backend->inst, task->fences[ri], q->device_affinity_mask))
                         task->fences[ri] = tm_carray_pop(task->fences);
                     else
                         ++ri;

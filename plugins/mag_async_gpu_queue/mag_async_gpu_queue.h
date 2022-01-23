@@ -8,19 +8,13 @@ struct tm_renderer_backend_i;
 
 typedef struct mag_async_gpu_queue_o mag_async_gpu_queue_o;
 
-typedef struct mag_async_gpu_queue_fence_t
-{
-    uint32_t fence_id;
-    uint32_t device_affinity_mask;
-} mag_async_gpu_queue_fence_t;
-
 typedef struct mag_async_gpu_queue_task_args_t
 {
     uint64_t task_id;
     void *data;
 
     // carray of fences that denote completion of the task
-    mag_async_gpu_queue_fence_t *out_fences;
+    uint32_t *out_fences;
     // the allocator to use when pushing to the out_fences carray
     struct tm_allocator_i *fences_allocator;
 } mag_async_gpu_queue_task_args_t;
@@ -28,6 +22,7 @@ typedef struct mag_async_gpu_queue_task_args_t
 typedef struct mag_async_gpu_queue_params_t
 {
     uint32_t max_simultaneous_tasks;
+    uint32_t device_affinity_mask;
 } mag_async_gpu_queue_params_t;
 
 typedef struct mag_async_gpu_queue_task_params_t

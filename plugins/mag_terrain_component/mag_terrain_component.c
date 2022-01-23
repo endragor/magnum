@@ -37,6 +37,7 @@ static struct mag_async_gpu_queue_api *mag_async_gpu_queue_api;
 #include <foundation/error.h>
 #include <foundation/hash.inl>
 #include <foundation/input.h>
+#include <foundation/job_system.h>
 #include <foundation/localizer.h>
 #include <foundation/log.h>
 #include <foundation/math.inl>
@@ -1288,6 +1289,7 @@ static void create_mag_terrain_component(tm_entity_context_o *ctx)
 
         mag_async_gpu_queue_params_t params = {
             .max_simultaneous_tasks = MAX_ASYNC_GPU_TASKS,
+            .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL,
         };
         manager->gpu_queue = mag_async_gpu_queue_api->create(&manager->allocator, backend, &params);
         tm_slab_create(&manager->ops, &manager->allocator, 64 * 1024);
@@ -1746,8 +1748,7 @@ void generate_region_task(mag_async_gpu_queue_task_args_t *args)
 
     uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
     uint32_t fence_id = readback_region_info(c, cmd_buf, state);
-    mag_async_gpu_queue_fence_t fence = { .fence_id = fence_id, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL };
-    tm_carray_push(args->out_fences, fence, args->fences_allocator);
+    tm_carray_push(args->out_fences, fence_id, args->fences_allocator);
 
     man->backend->submit_resource_command_buffers(man->backend->inst, &res_buf, 1);
     man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
@@ -1834,12 +1835,10 @@ void read_mesh_task(mag_async_gpu_queue_task_args_t *args)
 
     uint16_t state = TM_RENDERER_RESOURCE_STATE_COMPUTE_SHADER | TM_RENDERER_RESOURCE_STATE_UAV;
     uint32_t vertices_fence_id = readback_unpacked_vertices(task_buffers, c, cmd_buf, task_buffers->unpacked_vertices, state, c->region_info.num_vertices);
-    mag_async_gpu_queue_fence_t vertices_fence = { .fence_id = vertices_fence_id, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL };
-    tm_carray_push(args->out_fences, vertices_fence, args->fences_allocator);
+    tm_carray_push(args->out_fences, vertices_fence_id, args->fences_allocator);
 
     uint32_t indices_fence_id = readback_indices(task_buffers, c, cmd_buf, TM_RENDERER_RESOURCE_STATE_COPY_SOURCE, c->region_info.num_indices);
-    mag_async_gpu_queue_fence_t indices_fence = { .fence_id = indices_fence_id, .device_affinity_mask = TM_RENDERER_DEVICE_AFFINITY_MASK_ALL };
-    tm_carray_push(args->out_fences, indices_fence, args->fences_allocator);
+    tm_carray_push(args->out_fences, indices_fence_id, args->fences_allocator);
 
     man->backend->submit_resource_command_buffers(man->backend->inst, &res_buf, 1);
     man->backend->destroy_resource_command_buffers(man->backend->inst, &res_buf, 1);
@@ -1856,45 +1855,45 @@ static double *terrain_vertices_stat;
 
 static void do_generate_physics(generate_physics_task_data_t *data, tm_buffers_i *buffers, read_mesh_task_buffers_t *read_mesh_buffers)
 {
-        tm_physics_cook_mesh_raw_args_t args = {
-            .vertex_data = read_mesh_buffers->vertices,
-            .vertex_count = (uint32_t)tm_carray_size(read_mesh_buffers->vertices),
-            .vertex_stride = sizeof(tm_vec3_t),
+    tm_physics_cook_mesh_raw_args_t args = {
+        .vertex_data = read_mesh_buffers->vertices,
+        .vertex_count = (uint32_t)tm_carray_size(read_mesh_buffers->vertices),
+        .vertex_stride = sizeof(tm_vec3_t),
 
-            .index_data = read_mesh_buffers->indices,
-            .triangle_count = (uint32_t)tm_carray_size(read_mesh_buffers->indices) / 3,
-            .triangle_stride = sizeof(uint16_t) * 3,
+        .index_data = read_mesh_buffers->indices,
+        .triangle_count = (uint32_t)tm_carray_size(read_mesh_buffers->indices) / 3,
+        .triangle_stride = sizeof(uint16_t) * 3,
 
-            .flags = TM_PHYSICS_COOK_MESH_16_BIT_INDICES,
-        };
+        .flags = TM_PHYSICS_COOK_MESH_16_BIT_INDICES,
+    };
 
-        if (data->buffer_id) {
-            buffers->release(buffers->inst, data->buffer_id);
-            data->buffer_id = 0;
-        }
-
-        char *format;
-        uint32_t error;
-
-        struct tm_physics_shape_cooking_i *physics_cooking = tm_first_implementation(tm_global_api_registry, tm_physics_shape_cooking_i);
-        data->buffer_id = physics_cooking->cook_mesh_raw(physics_cooking->inst, &args, buffers, &format, &error);
-
-        if (data->buffer_id) {
-            uint64_t buf_size;
-            const void *buf_data = buffers->get(buffers->inst, data->buffer_id, &buf_size);
-            uint64_t buf_hash = buffers->hash(buffers->inst, data->buffer_id);
-
-            // the remaining component fields should already be initialized
-            data->physics_component.mesh = (tm_physics_shape_cooked_t) {
-                .format = format,
-                .size = buf_size,
-                .data = buf_data,
-                .hash = buf_hash,
-            };
-        } else {
-            TM_ERROR("Failed to cook physics mesh. Error: %u", error);
-        }
+    if (data->buffer_id) {
+        buffers->release(buffers->inst, data->buffer_id);
+        data->buffer_id = 0;
     }
+
+    char *format;
+    uint32_t error;
+
+    struct tm_physics_shape_cooking_i *physics_cooking = tm_first_implementation(tm_global_api_registry, tm_physics_shape_cooking_i);
+    data->buffer_id = physics_cooking->cook_mesh_raw(physics_cooking->inst, &args, buffers, &format, &error);
+
+    if (data->buffer_id) {
+        uint64_t buf_size;
+        const void *buf_data = buffers->get(buffers->inst, data->buffer_id, &buf_size);
+        uint64_t buf_hash = buffers->hash(buffers->inst, data->buffer_id);
+
+        // the remaining component fields should already be initialized
+        data->physics_component.mesh = (tm_physics_shape_cooked_t) {
+            .format = format,
+            .size = buf_size,
+            .data = buf_data,
+            .hash = buf_hash,
+        };
+    } else {
+        TM_ERROR("Failed to cook physics mesh. Error: %u", error);
+    }
+}
 
 static void generate_physics_job(void *task_data)
 {
@@ -2329,7 +2328,7 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
     uint64_t wait_physics_readbacks_profiler_id = tm_profiler_api->begin("wait_physics_readbacks", NULL, NULL);
     uint64_t remaining_updates = tm_carray_size(physics_update_fences);
     while (remaining_updates) {
-    for (physics_update_fences_t *update_info = physics_update_fences; update_info != tm_carray_end(physics_update_fences); ++update_info) {
+        for (physics_update_fences_t *update_info = physics_update_fences; update_info != tm_carray_end(physics_update_fences); ++update_info) {
             if (!update_info->vertices_read && man->backend->read_complete(man->backend->inst, update_info->vertices_fence, TM_RENDERER_DEVICE_AFFINITY_MASK_ALL)) {
                 update_info->vertices_read = true;
             }
@@ -2339,13 +2338,13 @@ static void engine__update_terrain(tm_engine_o *inst, tm_engine_update_set_t *da
             if (!update_info->task_started && update_info->vertices_read && update_info->indices_read) {
                 --remaining_updates;
                 update_info->task_started = true;
-        mag_terrain_component_t *c = update_info->c;
-            read_mesh_task_buffers_t *buffers = GET_BUFFERS(man->read_mesh_task_buffers, c->buffers->read_mesh_task_buffers_id);
-            tm_carray_resize(buffers->indices, c->buffers->region_info.num_indices, &man->allocator);
-            // TODO: job would be better in this case
+                mag_terrain_component_t *c = update_info->c;
+                read_mesh_task_buffers_t *buffers = GET_BUFFERS(man->read_mesh_task_buffers, c->buffers->read_mesh_task_buffers_id);
+                tm_carray_resize(buffers->indices, c->buffers->region_info.num_indices, &man->allocator);
+                // TODO: job would be better in this case
                 start_physics_task(man, c, NULL);
+            }
         }
-    }
     }
     tm_profiler_api->end(wait_physics_readbacks_profiler_id);
 
